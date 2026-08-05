@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.so
+
+# experiment outputs
+results/
+runs/
+*.log
+*.pt
+*.csv
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
