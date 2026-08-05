@@ -623,45 +623,94 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
         return 0.0
     print(f"\n[stage3] sliding-window fine-tuning (window={window}, stride={stride}, "
           f"epochs/window={epochs})")
+
     student_layers = get_layers(student)
+    dtype = next(student.parameters()).dtype
+    seqlen = calib_ids.shape[1]
     windows = make_windows(len(student_layers), window, stride)
-    runner = WindowRunner(teacher, student, calib_ids, device, batch_size)
-    runner.reset()
+
+    _kw: dict = {}
+
+    def kwargs_fn(bs: int):
+        if bs not in _kw:
+            _kw[bs] = build_decoder_kwargs(seqlen, dtype, device, bs)
+        return _kw[bs]
+
+    # --- Phase 1: one forward pass through all teacher layers, cache exits on CPU.
+    # teacher_exits[j] = teacher hidden state after layer j (before layer j+1).
+    # For window [i, i+w), the target is teacher_exits[i+w-1].
+    # This replaces the per-window teacher_window_out calls and advance_to teacher
+    # streaming — teacher layers run exactly once instead of ~(window+1) times each.
+    print("[stage3] pre-caching teacher activations (one pass)...")
+    teacher_layers = get_layers(teacher)
+    t_cache = HiddenCache.from_embeddings(teacher, calib_ids, device)
+    teacher_exits: list = []
+    for tlayer in tqdm(teacher_layers, desc="  teacher", leave=False):
+        tlayer.to(device)
+        with torch.no_grad():
+            t_cache = t_cache.advance(tlayer, device, batch_size, kwargs_fn)
+        tlayer.to("cpu")
+        teacher_exits.append(t_cache)
+        torch.cuda.empty_cache()
+    del t_cache
+    gc.collect()
+    torch.cuda.empty_cache()
+    # Teacher weights are no longer accessed after this point; the caller's
+    # `del teacher` will free them once this function returns.
+
+    # --- Phase 2: fine-tune student window by window.
+    # s_cache is advanced incrementally using already-fine-tuned student layers,
+    # so later windows see corrected inputs from earlier fine-tuned blocks.
+    s_cache = HiddenCache.from_embeddings(student, calib_ids, device)
+    s_pos = 0
 
     losses = []
     for w_idx, (i, w) in enumerate(windows):
-        runner.advance_to(i)
-        target = runner.teacher_window_out(i, w)
-        blocks = runner.student_window(i, w)
+        # Advance student cache to the start of this window.
+        while s_pos < i:
+            student_layers[s_pos].to(device)
+            with torch.no_grad():
+                s_cache = s_cache.advance(student_layers[s_pos], device, batch_size, kwargs_fn)
+            student_layers[s_pos].to("cpu")
+            s_pos += 1
+            torch.cuda.empty_cache()
 
-        params = []
+        target = teacher_exits[i + w - 1]
+
+        blocks = [student_layers[j] for j in range(i, i + w)]
         for blk in blocks:
-            for name, p in blk.named_parameters():
-                if "fc_v" in name or "fc_u" in name:
-                    p.requires_grad_(True)
-                    params.append(p)
+            blk.to(device)
+
+        params = [p for blk in blocks
+                  for name, p in blk.named_parameters()
+                  if "fc_v" in name or "fc_u" in name]
         if not params:
+            for blk in blocks:
+                blk.to("cpu")
             continue
+        for p in params:
+            p.requires_grad_(True)
         opt = torch.optim.AdamW(params, lr=lr)
 
         last = 0.0
         for ep in range(epochs):
             tot = 0.0
             nb = 0
-            pbar = tqdm(range(0, len(runner.s_cache), batch_size),
+            pbar = tqdm(range(0, len(s_cache), batch_size),
                         desc=f"  window {w_idx}/{len(windows)-1} [{i}:{i+w}] ep{ep+1}",
                         leave=False)
             for b in pbar:
-                x = runner.s_cache.data[b:b + batch_size].to(device)
+                x = s_cache.data[b:b + batch_size].to(device)
                 t = target.data[b:b + batch_size].to(device)
-                am, pid = runner.kwargs_fn(x.shape[0])
+                am, pid = kwargs_fn(x.shape[0])
                 for blk in blocks:
                     x = run_layer(blk, x, am, pid)
                 loss = feature_mse(x, t, rel_mse)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
-                tot += loss.item(); nb += 1
+                tot += loss.item()
+                nb += 1
                 pbar.set_postfix(mse=f"{loss.item():.5f}")
             last = tot / max(1, nb)
             print(f"  window {w_idx:>2} [{i}:{i+w}] epoch {ep+1}/{epochs} | mse {last:.6f}")
@@ -670,8 +719,8 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
         for blk in blocks:
             for p in blk.parameters():
                 p.requires_grad_(False)
-        runner.student_window(i, w, to_device=False)
-        del target, opt, params
+            blk.to("cpu")
+        del opt, params
         gc.collect()
         torch.cuda.empty_cache()
 
