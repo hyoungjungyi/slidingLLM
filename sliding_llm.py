@@ -165,8 +165,8 @@ def iter_gates(model_or_layers):
 # ==========================================================================
 # 2. Stage 0 — whitened SVD initialisation
 # ==========================================================================
-def _damped_cholesky(M, damp_alpha):
-    """Lower-triangular R with R R^T ~= M, GPTQ-style diagonal damping.
+def _damped_cholesky(M):
+    """Lower-triangular R with R R^T ~= M, SVD-LLM style microscopic shift.
 
     Any R satisfying R R^T = M gives the same optimal low-rank factorisation
     (the objective ||(W - W_hat) X||_F only sees M = X^T X), so Cholesky is used
@@ -175,7 +175,6 @@ def _damped_cholesky(M, damp_alpha):
     """
     d = M.shape[0]
     M = 0.5 * (M + M.t())
-    M = M + damp_alpha * torch.diagonal(M).mean() * torch.eye(d, dtype=M.dtype, device=M.device)
     try:
         return torch.linalg.cholesky(M)
     except Exception:
@@ -185,7 +184,7 @@ def _damped_cholesky(M, damp_alpha):
 
 
 @torch.no_grad()
-def build_svd_student(model, calib_ids, device, damp_alpha=0.01, batch_size=1,
+def build_svd_student(model, calib_ids, device, batch_size=1,
                       init_ratio=0.5, beta=0.1, temperature=10.0, z_slope=0.1):
     """Replace every target Linear with an SVDGateLinear, block by block.
 
@@ -245,7 +244,7 @@ def build_svd_student(model, calib_ids, device, damp_alpha=0.01, batch_size=1,
             bias = fc.bias.data.clone() if fc.bias is not None else None
 
             M = (cov[p] / max(1, ntok[p])).double()
-            R = _damped_cholesky(M, damp_alpha).float()
+            R = _damped_cholesky(M).float()
             del M
             cov[p] = None
 
@@ -582,7 +581,7 @@ def sliding_window_rank_search(teacher, student, calib_ids, device, ratio,
 # 7. Slicing
 # ==========================================================================
 @torch.no_grad()
-def slice_ranks(student, apply_mask=False):
+def slice_ranks(student):
     """Hard-truncate each gated layer into a factored `fc_v -> fc_u` pair."""
     print("\n[slice] materialising the learned ranks")
     for layer in tqdm(get_layers(student), desc="[slice]"):
@@ -593,8 +592,6 @@ def slice_ranks(student, apply_mask=False):
             idx = m.active_indices().to(m.W_u.device)
             W_u = m.W_u.data[:, idx].clone()
             W_v = m.W_v.data[idx, :].clone()
-            if apply_mask:
-                W_u = W_u * m.get_mask().detach()[idx].to(W_u.dtype)
             bias = m.bias.data.clone() if m.bias is not None else None
             r = W_u.shape[1]
             dtype, dev = W_u.dtype, W_u.device
@@ -701,7 +698,7 @@ def run(args):
 
     with Timer() as t:
         build_svd_student(student, calib_ids, device,
-                          damp_alpha=args.damp_alpha, batch_size=args.calib_batch_size,
+                          batch_size=args.calib_batch_size,
                           init_ratio=args.ratio, beta=args.beta,
                           temperature=args.temperature, z_slope=args.z_slope)
     timings["stage0_svd"] = t.elapsed
@@ -753,16 +750,16 @@ def run(args):
         print("\n[stage2] skipped")
 
     # --- slice + Stage 3 -------------------------------------------------
-    slice_ranks(student, apply_mask=args.apply_mask_on_slice)
+    slice_ranks(student)
     gc.collect(); torch.cuda.empty_cache()
 
     avg_mse = 0.0
     if not args.skip_stage3 and args.stage3_epochs > 0:
         with Timer() as t:
             avg_mse = sliding_window_finetune(
-                teacher, student, sw_ids, device, epochs=args.stage3_epochs,
+                teacher, student, calib_ids, device, epochs=args.stage3_epochs,
                 window=args.window, stride=args.stride, lr=args.ft_lr,
-                batch_size=args.sw_batch_size, rel_mse=args.rel_mse)
+                batch_size=args.calib_batch_size, rel_mse=args.rel_mse)
         timings["stage3_finetune"] = t.elapsed
 
     del teacher
@@ -795,8 +792,14 @@ def run(args):
         "layer_ranks": ranks,
         **report,
     }
-    if args.out_json:
-        save_result(args.out_json, payload)
+    out_json = args.out_json
+    if not out_json:
+        model_name = args.model_id.split("/")[-1]
+        out_json = f"results/{model_name}_r{args.ratio}.json"
+        
+    os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
+    save_result(out_json, payload)
+    print(f"\n[save] Result JSON saved to {out_json}")
     if args.save_model:
         os.makedirs(os.path.dirname(os.path.abspath(args.save_model)) or ".", exist_ok=True)
         torch.save({"model": student.cpu(), "tokenizer": tokenizer}, args.save_model)
@@ -845,7 +848,6 @@ def build_parser():
     p.add_argument("--temperature", type=float, default=10.0, help="Stage-2 sigmoid gate temperature")
     p.add_argument("--beta", type=float, default=0.1, help="Stage-1 tanh gate sharpness")
     p.add_argument("--z_slope", type=float, default=0.1, help="Stage-2 Z initialisation slope")
-    p.add_argument("--damp_alpha", type=float, default=0.01)
     p.add_argument("--rotate", type=str, default="none", choices=["none", "hadamard", "random"],
                    help="QuaRot-style orthogonal rotation of the residual stream before "
                         "Stage 0. Spreads the massive activations across all channels. "
@@ -855,8 +857,6 @@ def build_parser():
                    help="seed for the random Hadamard sign flips / random orthogonal Q")
     p.add_argument("--rel_mse", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--no_grad_ckpt", action="store_true")
-    p.add_argument("--apply_mask_on_slice", action="store_true",
-                   help="fold the learned gate values into W_u when slicing")
 
     # output
     p.add_argument("--out_json", type=str, default="")

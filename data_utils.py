@@ -39,11 +39,11 @@ def _load_split_text(dataset, split, data_root):
     cache_dir = os.path.join(data_root, sub)
 
     if dataset == "wikitext2":
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split, cache_dir=cache_dir)
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split, cache_dir=cache_dir, trust_remote_code=True)
         return "\n\n".join(ds["text"])
     if dataset == "ptb":
         hf_split = "validation" if split == "test" else split
-        ds = load_dataset("ptb_text_only", "penn_treebank", split=hf_split, cache_dir=cache_dir)
+        ds = load_dataset("ptb_text_only", "penn_treebank", split=hf_split, cache_dir=cache_dir, trust_remote_code=True)
         return "\n\n".join(ds["sentence"])
     raise ValueError(dataset)
 
