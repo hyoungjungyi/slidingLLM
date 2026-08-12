@@ -415,10 +415,36 @@ def global_rank_search(student, calib_ids, target_hidden, device, ratio,
 # ==========================================================================
 # 5. Sliding-window driver (shared by Stage 2 and Stage 3)
 # ==========================================================================
-def make_windows(num_layers, window, stride):
+def make_windows(num_layers, window, stride, progressive=False):
     if num_layers < window:
         raise ValueError(f"model has {num_layers} blocks, window is {window}")
-    return [(i, window) for i in range(0, num_layers - window + 1, stride)]
+    windows = []
+    
+    if not progressive:
+        return [(i, window) for i in range(0, num_layers - window + 1, stride)]
+        
+    # 1. Progressive Expansion (Shallow)
+    for w in range(1, window + 1):
+        windows.append((0, w))
+        
+    # 2. Sliding (Intermediate)
+    start_sliding = window - 1
+    end_sliding = num_layers - 2 * window + 1
+    
+    if end_sliding >= start_sliding:
+        sliding_starts = list(range(start_sliding, end_sliding, stride))
+        if not sliding_starts or sliding_starts[-1] != end_sliding:
+            sliding_starts.append(end_sliding)
+            
+        for i in sliding_starts:
+            windows.append((i, window))
+            
+    # 3. Progressive Contraction (Deep)
+    contract_start = num_layers - window
+    for w in range(window, 0, -1):
+        windows.append((contract_start, w))
+        
+    return windows
 
 
 class WindowRunner:
@@ -614,14 +640,22 @@ def slice_ranks(student):
 # 8. Stage 3 — sliding-window fine-tuning
 # ==========================================================================
 def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
-                            window=4, stride=1, lr=1e-4, batch_size=1, rel_mse=True):
+                            window=4, stride=1, lr=1e-4, batch_size=1, rel_mse=True, weight_decay=0.01,
+                            stage3inner=False, stage3innerpercent=False, stage3progressive=False):
     if epochs <= 0:
         print("\n[stage3] skipped (epochs=0)")
         return 0.0
     print(f"\n[stage3] sliding-window fine-tuning (window={window}, stride={stride}, "
           f"epochs/window={epochs})")
     student_layers = get_layers(student)
-    windows = make_windows(len(student_layers), window, stride)
+    windows = make_windows(len(student_layers), window, stride, progressive=stage3progressive)
+    
+    if stage3inner:
+        windows = [(i, w) for i, w in windows if i >= 4 and (i + w - 1) < len(student_layers) - 4]
+    elif stage3innerpercent:
+        skip_first = int(len(student_layers) * 0.20)
+        skip_last = int(len(student_layers) * 0.15)
+        windows = [(i, w) for i, w in windows if i >= skip_first and (i + w - 1) < len(student_layers) - skip_last]
     runner = WindowRunner(teacher, student, calib_ids, device, batch_size)
     runner.reset()
 
@@ -639,7 +673,7 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                     params.append(p)
         if not params:
             continue
-        opt = torch.optim.AdamW(params, lr=lr)
+        opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
         last = 0.0
         for ep in range(epochs):
@@ -756,10 +790,12 @@ def run(args):
     avg_mse = 0.0
     if not args.skip_stage3 and args.stage3_epochs > 0:
         with Timer() as t:
+            wd = 0.0 if args.disable_ft_weight_decay else 0.01
             avg_mse = sliding_window_finetune(
                 teacher, student, calib_ids, device, epochs=args.stage3_epochs,
                 window=args.window, stride=args.stride, lr=args.ft_lr,
-                batch_size=args.calib_batch_size, rel_mse=args.rel_mse)
+                batch_size=args.calib_batch_size, rel_mse=args.rel_mse,
+                weight_decay=wd, stage3inner=args.stage3inner, stage3innerpercent=args.stage3innerpercent, stage3progressive=args.stage3progressive)
         timings["stage3_finetune"] = t.elapsed
 
     del teacher
@@ -839,10 +875,14 @@ def build_parser():
     p.add_argument("--skip_stage1", action="store_true")
     p.add_argument("--skip_stage2", action="store_true")
     p.add_argument("--skip_stage3", action="store_true")
+    p.add_argument("--stage3inner", action="store_true", help="Skip fine-tuning the first 4 and last 4 blocks in Stage 3")
+    p.add_argument("--stage3innerpercent", action="store_true", help="Skip fine-tuning the first 20%% and last 15%% of blocks in Stage 3")
+    p.add_argument("--stage3progressive", action="store_true", help="Progressively increase and decrease window size at the ends in Stage 3")
 
     # optimisation
     p.add_argument("--rank_lr", type=float, default=5.0)
     p.add_argument("--ft_lr", type=float, default=1e-4)
+    p.add_argument("--disable_ft_weight_decay", action="store_true", help="Disable AdamW weight decay in Stage 3")
     p.add_argument("--lambda_rank", type=float, default=1.0)
     p.add_argument("--lambda_lr", type=float, default=10.0)
     p.add_argument("--temperature", type=float, default=10.0, help="Stage-2 sigmoid gate temperature")
