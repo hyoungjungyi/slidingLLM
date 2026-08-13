@@ -36,6 +36,7 @@ Example
 """
 import argparse
 import gc
+import json
 import math
 import os
 from collections import OrderedDict
@@ -515,11 +516,25 @@ class WindowRunner:
 # ==========================================================================
 # 6. Stage 2 — sliding-window rank allocation
 # ==========================================================================
+def _save_stage2(path, student, epoch, lambdas):
+    torch.save({"epoch": epoch,
+                "Z": [m.Z.detach().cpu().clone() for m in iter_gates(student)],
+                "lambdas": lambdas}, path + ".tmp")
+    os.replace(path + ".tmp", path)          # atomic: a crash mid-write can't corrupt it
+
+
+def _load_stage2(path, student):
+    ck = torch.load(path, map_location="cpu")
+    for m, z in zip(iter_gates(student), ck["Z"]):
+        m.Z.data.copy_(z.to(m.Z.device))
+    return ck["epoch"], ck["lambdas"]
+
+
 def sliding_window_rank_search(teacher, student, calib_ids, device, ratio,
                                epochs=10, window=4, stride=1, stagger=2,
                                lr=5.0, lambda_rank=1.0, lambda_lr=10.0,
                                batch_size=1, rel_mse=True,
-                               target_ratio_override=None):
+                               target_ratio_override=None, ckpt_path=None):
     print(f"\n[stage2] sliding-window rank search (window={window}, stride={stride}, "
           f"stagger={stagger}, epochs={epochs})")
     student_layers = get_layers(student)
@@ -537,7 +552,16 @@ def sliding_window_rank_search(teacher, student, calib_ids, device, ratio,
     print("  per-window target ratios: " +
           ", ".join(f"{t:.3f}" for t in window_targets))
 
-    for epoch in range(epochs):
+    # Stage 2 is the long pole (hours) and this is a shared GPU box, so an
+    # epoch-granular checkpoint turns an OOM from "lose everything" into
+    # "lose one epoch".
+    start_epoch = 0
+    if ckpt_path and os.path.exists(ckpt_path):
+        start_epoch, window_lambdas = _load_stage2(ckpt_path, student)
+        print(f"  [resume] {ckpt_path}: continuing from epoch {start_epoch + 1}/{epochs} "
+              f"| hard ratio {hard_size_ratio(list(iter_gates(student))):.4f}")
+
+    for epoch in range(start_epoch, epochs):
         offset = epoch % max(1, stagger)
         print(f"\n--- [stage2] epoch {epoch+1}/{epochs} (parity {offset}) ---")
         runner.reset()
@@ -600,6 +624,10 @@ def sliding_window_rank_search(teacher, student, calib_ids, device, ratio,
             gc.collect()
             torch.cuda.empty_cache()
 
+        if ckpt_path:
+            _save_stage2(ckpt_path, student, epoch + 1, window_lambdas)
+            print(f"  [ckpt] epoch {epoch+1}/{epochs} saved -> {ckpt_path}")
+
     print(f"[stage2] final global hard ratio: {hard_size_ratio(list(iter_gates(student))):.4f}")
 
 
@@ -636,33 +664,132 @@ def slice_ranks(student):
     return student
 
 
+def save_sliced(student, path):
+    """Checkpoint the model as it stands right after `slice_ranks`.
+
+    Stages 0-2 cost hours and do not depend on anything Stage 3 varies, so an
+    experiment that only changes Stage 3 should pay for them once.
+    """
+    ranks = {}
+    for li, layer in enumerate(get_layers(student)):
+        for p in layer_linear_paths(layer):
+            m = get_module(layer, p)
+            ranks[f"{li}.{p}"] = int(getattr(m, "rank", None) or m[0].out_features)
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    torch.save({"ranks": ranks, "state_dict": student.state_dict()}, path)
+    n = sum(p.numel() for p in student.parameters())
+    print(f"[save] sliced student -> {path} ({n/1e9:.2f}B params, "
+          f"{os.path.getsize(path)/1e9:.1f} GB)")
+
+
+def load_sliced(student, path):
+    """Rebuild the factored `fc_v -> fc_u` pairs and load their weights."""
+    ck = torch.load(path, map_location="cpu")
+    dtype = next(student.parameters()).dtype
+    for li, layer in enumerate(get_layers(student)):
+        for p in layer_linear_paths(layer):
+            fc = get_module(layer, p)
+            r = ck["ranks"][f"{li}.{p}"]
+            fc_v = nn.Linear(fc.in_features, r, bias=False)
+            fc_u = nn.Linear(r, fc.out_features, bias=fc.bias is not None)
+            seq = nn.Sequential(OrderedDict([("fc_v", fc_v), ("fc_u", fc_u)])).to(dtype)
+            seq.rank = r
+            set_module(layer, p, seq)
+    student.load_state_dict(ck["state_dict"])
+    del ck
+    gc.collect()
+    return student
+
+
+def load_ranks_into_gates(student, path):
+    """Adopt the per-linear ranks a previous run's result JSON recorded.
+
+    `layer_rank_string` writes them in `layer_linear_paths` order, which is the
+    order this walks, so the two stay in step.
+    """
+    learned = [int(x) for x in json.load(open(path))["layer_ranks"].split(",")]
+    n = 0
+    for layer in get_layers(student):
+        for p in layer_linear_paths(layer):
+            get_module(layer, p).k.data.fill_(float(learned[n]))
+            n += 1
+    if n != len(learned):
+        raise ValueError(f"{path} has {len(learned)} ranks but the model has {n} linears")
+    return n
+
+
 # ==========================================================================
 # 8. Stage 3 — sliding-window fine-tuning
 # ==========================================================================
+def stage3_schedule(num_layers, window, stride, progressive=False,
+                    inner=False, innerpercent=False, skip_ends=0, edge="skip"):
+    """The Stage-3 task list as `(start, width, mode)`, in forward order.
+
+    `mode` decides where the *input* comes from:
+
+      "sliding"     input = the student's own accumulated activation at `start`,
+                    so the window has to absorb all upstream drift as well as
+                    approximate its own blocks. This is the error-correcting
+                    objective the sliding window exists for.
+
+      "individual"  input = the *teacher's* activation at `start` — a pure
+                    per-block reconstruction. No accumulated drift enters, so
+                    the fit is well conditioned even where the block performs a
+                    near-exact cancellation (blocks 29-31 on Llama-2-7B, where
+                    the residual-stream massive activations are unwound and a
+                    relative error in the block's output is amplified ~26x).
+
+    `--stage3inner` / `--stage3innerpercent` carve out an inner band of blocks
+    for the sliding windows; `edge` says what happens to the blocks outside it.
+    """
+    windows = make_windows(num_layers, window, stride, progressive=progressive)
+    if skip_ends > 0:
+        lo, hi = skip_ends, num_layers - skip_ends
+    elif inner:
+        lo, hi = 4, num_layers - 4
+    elif innerpercent:
+        lo, hi = int(num_layers * 0.20), num_layers - int(num_layers * 0.15)
+    else:
+        return [(i, w, "sliding") for i, w in windows]
+
+    tasks = [(i, w, "sliding") for i, w in windows if i >= lo and (i + w - 1) < hi]
+    if edge == "individual":
+        tasks += [(b, 1, "individual")
+                  for b in list(range(lo)) + list(range(hi, num_layers))]
+    return sorted(tasks, key=lambda t: (t[0], t[1]))
+
+
 def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                             window=4, stride=1, lr=1e-4, batch_size=1, rel_mse=True, weight_decay=0.01,
-                            stage3inner=False, stage3innerpercent=False, stage3progressive=False):
+                            stage3inner=False, stage3innerpercent=False, stage3progressive=False,
+                            edge="skip", edge_lr=None, clip_grad=0.0):
     if epochs <= 0:
         print("\n[stage3] skipped (epochs=0)")
         return 0.0
-    print(f"\n[stage3] sliding-window fine-tuning (window={window}, stride={stride}, "
-          f"epochs/window={epochs})")
     student_layers = get_layers(student)
-    windows = make_windows(len(student_layers), window, stride, progressive=stage3progressive)
-    
-    if stage3inner:
-        windows = [(i, w) for i, w in windows if i >= 4 and (i + w - 1) < len(student_layers) - 4]
-    elif stage3innerpercent:
-        skip_first = int(len(student_layers) * 0.20)
-        skip_last = int(len(student_layers) * 0.15)
-        windows = [(i, w) for i, w in windows if i >= skip_first and (i + w - 1) < len(student_layers) - skip_last]
+    tasks = stage3_schedule(len(student_layers), window, stride,
+                            progressive=stage3progressive, inner=stage3inner,
+                            innerpercent=stage3innerpercent, skip_ends=skip_ends,
+                            edge=edge)
+    n_ind = sum(1 for _, _, m in tasks if m == "individual")
+    print(f"\n[stage3] fine-tuning (window={window}, stride={stride}, "
+          f"epochs/task={epochs}) | {len(tasks)} tasks "
+          f"({len(tasks) - n_ind} sliding, {n_ind} individual/teacher-forced)")
+    if n_ind:
+        print("  individual blocks: " +
+              ", ".join(str(i) for i, _, m in tasks if m == "individual"))
     runner = WindowRunner(teacher, student, calib_ids, device, batch_size)
     runner.reset()
 
+    edge_lr = lr if edge_lr is None else edge_lr
     losses = []
-    for w_idx, (i, w) in enumerate(windows):
+    for t_idx, (i, w, mode) in enumerate(tasks):
         runner.advance_to(i)
+        # teacher_window_out() reads t_cache without consuming it, so t_cache is
+        # still the teacher's activation *entering* block i — the teacher-forced
+        # input for "individual" tasks.
         target = runner.teacher_window_out(i, w)
+        src = runner.t_cache if mode == "individual" else runner.s_cache
         blocks = runner.student_window(i, w)
 
         params = []
@@ -673,17 +800,19 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                     params.append(p)
         if not params:
             continue
-        opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        task_lr = edge_lr if mode == "individual" else lr
+        opt = torch.optim.AdamW(params, lr=task_lr, weight_decay=weight_decay)
+        tag = "block" if mode == "individual" else "window"
 
         last = 0.0
         for ep in range(epochs):
             tot = 0.0
             nb = 0
-            pbar = tqdm(range(0, len(runner.s_cache), batch_size),
-                        desc=f"  window {w_idx}/{len(windows)-1} [{i}:{i+w}] ep{ep+1}",
+            pbar = tqdm(range(0, len(src), batch_size),
+                        desc=f"  {tag} {t_idx}/{len(tasks)-1} [{i}:{i+w}] ep{ep+1}",
                         leave=False)
             for b in pbar:
-                x = runner.s_cache.data[b:b + batch_size].to(device)
+                x = src.data[b:b + batch_size].to(device)
                 t = target.data[b:b + batch_size].to(device)
                 am, pid = runner.kwargs_fn(x.shape[0])
                 for blk in blocks:
@@ -691,11 +820,14 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                 loss = feature_mse(x, t, rel_mse)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
+                if clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(params, clip_grad)
                 opt.step()
                 tot += loss.item(); nb += 1
                 pbar.set_postfix(mse=f"{loss.item():.5f}")
             last = tot / max(1, nb)
-            print(f"  window {w_idx:>2} [{i}:{i+w}] epoch {ep+1}/{epochs} | mse {last:.6f}")
+            print(f"  {tag} {t_idx:>2} [{i}:{i+w}] ({mode[:4]}) epoch {ep+1}/{epochs} "
+                  f"| mse {last:.6f}")
         losses.append(last)
 
         for blk in blocks:
@@ -703,6 +835,7 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                 p.requires_grad_(False)
         runner.student_window(i, w, to_device=False)
         del target, opt, params
+        src = None
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -729,6 +862,17 @@ def run(args):
     sw_ids = calib_ids[:args.sw_nsamples]
 
     timings = {}
+    teacher = None
+
+    # --- resume straight from a cached sliced student ---------------------
+    if args.load_sliced:
+        print(f"\n[load] sliced student from {args.load_sliced} "
+              f"— skipping Stage 0, 1, 2 and the slice")
+        with Timer() as t:
+            load_sliced(student, args.load_sliced)
+        timings["load_sliced"] = t.elapsed
+        gc.collect(); torch.cuda.empty_cache()
+        return _finish(args, student, tokenizer, teacher, Q, sw_ids, timings, device)
 
     with Timer() as t:
         build_svd_student(student, calib_ids, device,
@@ -739,6 +883,14 @@ def run(args):
 
     gates = list(iter_gates(student))
     print(f"[stage0] {len(gates)} gated linears | init hard ratio {hard_size_ratio(gates):.4f}")
+
+    # --- adopt a previous run's rank allocation ---------------------------
+    if args.load_ranks:
+        n = load_ranks_into_gates(student, args.load_ranks)
+        print(f"[ranks] loaded {n} per-linear ranks from {args.load_ranks} "
+              f"| hard ratio {hard_size_ratio(gates):.4f}")
+        print("[ranks] Stages 1 and 2 skipped — they would overwrite these ranks")
+        args.skip_stage1 = args.skip_stage2 = True
 
     # --- Stage 1 ---------------------------------------------------------
     if not args.skip_stage1 and args.stage1_epochs > 0:
@@ -766,7 +918,6 @@ def run(args):
 
     teacher, _ = load_llm(args.model_id, args.dtype, args.seqlen)
     rotation.apply_rotation(teacher, args.rotate, args.rotate_seed, device, Q=Q)
-    del Q
     gc.collect(); torch.cuda.empty_cache()
 
     # --- Stage 2 ---------------------------------------------------------
@@ -778,27 +929,47 @@ def run(args):
                 stagger=args.stagger, lr=args.rank_lr, lambda_rank=args.lambda_rank,
                 lambda_lr=args.lambda_lr, batch_size=args.sw_batch_size,
                 rel_mse=args.rel_mse,
-                target_ratio_override=args.ratio if args.skip_stage1 else None)
+                target_ratio_override=args.ratio if args.skip_stage1 else None,
+                ckpt_path=args.stage2_ckpt or None)
         timings["stage2_window_rank"] = t.elapsed
     else:
         print("\n[stage2] skipped")
 
-    # --- slice + Stage 3 -------------------------------------------------
+    # --- slice ------------------------------------------------------------
     slice_ranks(student)
     gc.collect(); torch.cuda.empty_cache()
+    if args.save_sliced:
+        save_sliced(student, args.save_sliced)
 
+    return _finish(args, student, tokenizer, teacher, Q, sw_ids, timings, device)
+
+
+def _finish(args, student, tokenizer, teacher, Q, sw_ids, timings, device):
+    """Stage 3 + evaluation + reporting.
+
+    Split out of `run()` so `--load_sliced` can jump straight here: Stages 0-2
+    take hours and nothing Stage 3 varies feeds back into them.
+    """
     avg_mse = 0.0
     if not args.skip_stage3 and args.stage3_epochs > 0:
+        if teacher is None:
+            teacher, _ = load_llm(args.model_id, args.dtype, args.seqlen)
+            rotation.apply_rotation(teacher, args.rotate, args.rotate_seed, device, Q=Q)
         with Timer() as t:
             wd = 0.0 if args.disable_ft_weight_decay else 0.01
             avg_mse = sliding_window_finetune(
-                teacher, student, calib_ids, device, epochs=args.stage3_epochs,
+                teacher, student, sw_ids, device, epochs=args.stage3_epochs,
                 window=args.window, stride=args.stride, lr=args.ft_lr,
-                batch_size=args.calib_batch_size, rel_mse=args.rel_mse,
-                weight_decay=wd, stage3inner=args.stage3inner, stage3innerpercent=args.stage3innerpercent, stage3progressive=args.stage3progressive)
+                batch_size=args.sw_batch_size, rel_mse=args.rel_mse,
+                weight_decay=wd, stage3inner=args.stage3inner,
+                stage3innerpercent=args.stage3innerpercent,
+                stage3progressive=args.stage3progressive,
+                skip_ends=args.stage3_skip_ends,
+                edge=args.stage3_edge, edge_lr=args.stage3_edge_lr,
+                clip_grad=args.ft_clip_grad)
         timings["stage3_finetune"] = t.elapsed
 
-    del teacher
+    del teacher, Q
     gc.collect(); torch.cuda.empty_cache()
 
     # --- evaluate --------------------------------------------------------
@@ -858,7 +1029,9 @@ def build_parser():
     p.add_argument("--calib_dataset", type=str, default="wikitext2")
     p.add_argument("--eval_datasets", type=str, default="wikitext2")
     p.add_argument("--nsamples", type=int, default=128, help="sequences for the whitening covariance")
-    p.add_argument("--sw_nsamples", type=int, default=32, help="sequences for stages 1-3")
+    p.add_argument("--sw_nsamples", type=int, default=128,
+                   help="sequences for stages 1-3 (the first --sw_nsamples of the "
+                        "--nsamples calibration set; all three stages see the same ones)")
     p.add_argument("--calib_batch_size", type=int, default=1)
     p.add_argument("--sw_batch_size", type=int, default=1)
     p.add_argument("--stage1_batch_size", type=int, default=1)
@@ -878,6 +1051,22 @@ def build_parser():
     p.add_argument("--stage3inner", action="store_true", help="Skip fine-tuning the first 4 and last 4 blocks in Stage 3")
     p.add_argument("--stage3innerpercent", action="store_true", help="Skip fine-tuning the first 20%% and last 15%% of blocks in Stage 3")
     p.add_argument("--stage3progressive", action="store_true", help="Progressively increase and decrease window size at the ends in Stage 3")
+    p.add_argument("--stage3_skip_ends", type=int, default=0,
+                   help="leave the first N and last N blocks out of the Stage-3 "
+                        "sliding windows (1 = just blocks 0 and N-1; 4 reproduces "
+                        "--stage3inner). Takes precedence over the two flags above")
+    p.add_argument("--stage3_edge", type=str, default="skip", choices=["skip", "individual"],
+                   help="What to do with the blocks that --stage3inner/--stage3innerpercent "
+                        "leave outside the sliding band: 'skip' them (default), or fine-tune "
+                        "each one 'individual'ly, teacher-forced (input = the dense model's "
+                        "activation at that boundary, so no upstream drift enters the fit)")
+    p.add_argument("--stage3_edge_lr", type=float, default=None,
+                   help="learning rate for the individually fine-tuned edge blocks "
+                        "(defaults to --ft_lr)")
+    p.add_argument("--ft_clip_grad", type=float, default=0.0,
+                   help="max grad-norm for Stage 3; 0 disables. Single-sample loss spikes "
+                        "of 1e6 have been observed in the deep windows, so 1.0 is a "
+                        "reasonable value")
 
     # optimisation
     p.add_argument("--rank_lr", type=float, default=5.0)
@@ -897,6 +1086,23 @@ def build_parser():
                    help="seed for the random Hadamard sign flips / random orthogonal Q")
     p.add_argument("--rel_mse", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--no_grad_ckpt", action="store_true")
+
+    # checkpointing — Stages 0-2 cost hours and nothing in Stage 3 feeds back
+    # into them, so a Stage-3 sweep should pay for them exactly once.
+    p.add_argument("--stage2_ckpt", type=str, default="",
+                   help="save the Stage-2 gate state after every epoch and resume "
+                        "from it if the file already exists — Stage 2 runs for hours "
+                        "on a shared box and an OOM otherwise loses all of it")
+    p.add_argument("--load_ranks", type=str, default="",
+                   help="adopt the per-linear `layer_ranks` recorded in a previous "
+                        "run's result JSON and skip Stages 1 and 2 (Stage 0's SVD "
+                        "still runs)")
+    p.add_argument("--save_sliced", type=str, default="",
+                   help="checkpoint the student right after the slice, so later "
+                        "Stage-3 variants can start from it")
+    p.add_argument("--load_sliced", type=str, default="",
+                   help="resume from a --save_sliced checkpoint: skips Stage 0, 1, 2 "
+                        "and the slice entirely")
 
     # output
     p.add_argument("--out_json", type=str, default="")

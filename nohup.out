@@ -1,0 +1,26 @@
+/home/nas4_user/kangeunjeon/anaconda3/envs/hj_svdllm/lib/python3.9/site-packages/transformers/utils/generic.py:441: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
+/home/nas4_user/kangeunjeon/anaconda3/envs/hj_svdllm/lib/python3.9/site-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+/home/nas4_user/kangeunjeon/anaconda3/envs/hj_svdllm/lib/python3.9/site-packages/transformers/utils/generic.py:309: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
+/home/nas4_user/kangeunjeon/anaconda3/envs/hj_svdllm/lib/python3.9/site-packages/transformers/utils/generic.py:309: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
+=== SlidingLLM | meta-llama/Llama-2-7b-hf | target ratio 0.8 ===
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:11<00:11, 11.58s/it]Loading checkpoint shards:  50%|█████     | 1/2 [00:13<00:13, 13.84s/it]
+Traceback (most recent call last):
+  File "/home/kangeunjeon/hyunjung/slidingLLM/sliding_llm.py", line 868, in <module>
+    run(build_parser().parse_args())
+  File "/home/kangeunjeon/hyunjung/slidingLLM/sliding_llm.py", line 686, in run
+    student, tokenizer = load_llm(args.model_id, args.dtype, args.seqlen)
+  File "/home/kangeunjeon/hyunjung/slidingLLM/llm_utils.py", line 38, in load_llm
+    model = AutoModelForCausalLM.from_pretrained(
+  File "/home/nas4_user/kangeunjeon/anaconda3/envs/hj_svdllm/lib/python3.9/site-packages/transformers/models/auto/auto_factory.py", line 566, in from_pretrained
+    return model_class.from_pretrained(
+  File "/home/nas4_user/kangeunjeon/anaconda3/envs/hj_svdllm/lib/python3.9/site-packages/transformers/modeling_utils.py", line 3480, in from_pretrained
+    ) = cls._load_pretrained_model(
+  File "/home/nas4_user/kangeunjeon/anaconda3/envs/hj_svdllm/lib/python3.9/site-packages/transformers/modeling_utils.py", line 3870, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+  File "/home/nas4_user/kangeunjeon/anaconda3/envs/hj_svdllm/lib/python3.9/site-packages/transformers/modeling_utils.py", line 708, in _load_state_dict_into_meta_model
+    param = param.to(dtype)
+KeyboardInterrupt
