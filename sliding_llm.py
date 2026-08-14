@@ -721,6 +721,29 @@ def load_ranks_into_gates(student, path):
 # ==========================================================================
 # 8. Stage 3 — sliding-window fine-tuning
 # ==========================================================================
+def build_ft_optimizer(params, lr_mode, lr, rel_lr, weight_decay):
+    """AdamW for Stage 3, optionally with a per-tensor scale-relative step.
+
+    Adam's update is ~`lr` per step no matter how big the gradient or the weight
+    is, so one global `lr` means very different things to different tensors. The
+    whitened SVD makes that gap extreme: `W_u = U sqrt(S)` while
+    `W_v = sqrt(S) Vt R^-1`, so on Llama-2-7B layer 0 the two halves of the same
+    factored linear differ in RMS by ~150x. At lr=1e-4 that is 16x the weight's
+    own size for `down_proj.fc_u` and 0.1x for `down_proj.fc_v` over one window.
+
+    In "relative" mode each tensor gets `lr = rel_lr * rms(W)`, so the *fraction*
+    of its own size a tensor can move over a window is `rel_lr * steps` for every
+    tensor alike — one interpretable knob instead of a scale lottery.
+    """
+    if lr_mode != "relative":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    groups = []
+    for p in params:
+        rms = float(p.detach().float().pow(2).mean().sqrt())
+        groups.append({"params": [p], "lr": rel_lr * max(rms, 1e-8)})
+    return torch.optim.AdamW(groups, lr=rel_lr, weight_decay=weight_decay)
+
+
 def stage3_schedule(num_layers, window, stride, progressive=False,
                     inner=False, innerpercent=False, skip_ends=0, edge="skip"):
     """The Stage-3 task list as `(start, width, mode)`, in forward order.
@@ -762,7 +785,8 @@ def stage3_schedule(num_layers, window, stride, progressive=False,
 def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                             window=4, stride=1, lr=1e-4, batch_size=1, rel_mse=True, weight_decay=0.01,
                             stage3inner=False, stage3innerpercent=False, stage3progressive=False,
-                            edge="skip", edge_lr=None, clip_grad=0.0):
+                            skip_ends=0, edge="skip", edge_lr=None, clip_grad=0.0,
+                            lr_mode="const", rel_lr=3e-5):
     if epochs <= 0:
         print("\n[stage3] skipped (epochs=0)")
         return 0.0
@@ -772,7 +796,15 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
     student_layers = get_layers(student)
     dtype = next(student.parameters()).dtype
     seqlen = calib_ids.shape[1]
-    windows = make_windows(len(student_layers), window, stride)
+    tasks = stage3_schedule(len(student_layers), window, stride,
+                            progressive=stage3progressive, inner=stage3inner,
+                            innerpercent=stage3innerpercent, skip_ends=skip_ends,
+                            edge=edge)
+    n_ind = sum(1 for _, _, m in tasks if m == "individual")
+    touched = sorted({b for i, w, _ in tasks for b in range(i, i + w)})
+    print(f"[stage3] {len(tasks)} tasks ({len(tasks) - n_ind} sliding, {n_ind} individual)"
+          f" | blocks {touched[0]}-{touched[-1]}"
+          f" | untouched {sorted(set(range(len(student_layers))) - set(touched))}")
 
     _kw: dict = {}
 
@@ -789,6 +821,7 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
     print("[stage3] pre-caching teacher activations (one pass)...")
     teacher_layers = get_layers(teacher)
     t_cache = HiddenCache.from_embeddings(teacher, calib_ids, device)
+    teacher_embed = t_cache                 # activation entering block 0
     teacher_exits: list = []
     for tlayer in tqdm(teacher_layers, desc="  teacher", leave=False):
         tlayer.to(device)
@@ -809,9 +842,13 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
     s_cache = HiddenCache.from_embeddings(student, calib_ids, device)
     s_pos = 0
 
+    def teacher_in(j):
+        """Teacher activation *entering* block j — the teacher-forced input."""
+        return teacher_embed if j == 0 else teacher_exits[j - 1]
+
     edge_lr = lr if edge_lr is None else edge_lr
     losses = []
-    for w_idx, (i, w) in enumerate(windows):
+    for w_idx, (i, w, mode) in enumerate(tasks):
         # Advance student cache to the start of this window.
         while s_pos < i:
             student_layers[s_pos].to(device)
@@ -822,6 +859,11 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
             torch.cuda.empty_cache()
 
         target = teacher_exits[i + w - 1]
+        # "individual" feeds the teacher's own activation in, so the block is fit
+        # locally with no upstream drift to absorb; "sliding" feeds the student's
+        # accumulated activation, which is what makes the window error-correcting.
+        src = teacher_in(i) if mode == "individual" else s_cache
+        tag = "block " if mode == "individual" else "window"
 
         blocks = [student_layers[j] for j in range(i, i + w)]
         for blk in blocks:
@@ -836,17 +878,18 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
             continue
         for p in params:
             p.requires_grad_(True)
-        opt = torch.optim.AdamW(params, lr=lr)
+        task_lr = edge_lr if mode == "individual" else lr
+        opt = build_ft_optimizer(params, lr_mode, task_lr, rel_lr, weight_decay)
 
         last = 0.0
         for ep in range(epochs):
             tot = 0.0
             nb = 0
-            pbar = tqdm(range(0, len(s_cache), batch_size),
-                        desc=f"  window {w_idx}/{len(windows)-1} [{i}:{i+w}] ep{ep+1}",
+            pbar = tqdm(range(0, len(src), batch_size),
+                        desc=f"  {tag} {w_idx}/{len(tasks)-1} [{i}:{i+w}] ep{ep+1}",
                         leave=False)
             for b in pbar:
-                x = s_cache.data[b:b + batch_size].to(device)
+                x = src.data[b:b + batch_size].to(device)
                 t = target.data[b:b + batch_size].to(device)
                 am, pid = kwargs_fn(x.shape[0])
                 for blk in blocks:
@@ -861,7 +904,7 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                 nb += 1
                 pbar.set_postfix(mse=f"{loss.item():.5f}")
             last = tot / max(1, nb)
-            print(f"  {tag} {t_idx:>2} [{i}:{i+w}] ({mode[:4]}) epoch {ep+1}/{epochs} "
+            print(f"  {tag} {w_idx:>2} [{i}:{i+w}] ({mode[:4]}) epoch {ep+1}/{epochs} "
                   f"| mse {last:.6f}")
         losses.append(last)
 
@@ -1000,7 +1043,8 @@ def _finish(args, student, tokenizer, teacher, Q, sw_ids, timings, device):
                 stage3progressive=args.stage3progressive,
                 skip_ends=args.stage3_skip_ends,
                 edge=args.stage3_edge, edge_lr=args.stage3_edge_lr,
-                clip_grad=args.ft_clip_grad)
+                clip_grad=args.ft_clip_grad,
+                lr_mode=args.ft_lr_mode, rel_lr=args.ft_rel_lr)
         timings["stage3_finetune"] = t.elapsed
 
     del teacher, Q
@@ -1097,6 +1141,15 @@ def build_parser():
     p.add_argument("--stage3_edge_lr", type=float, default=None,
                    help="learning rate for the individually fine-tuned edge blocks "
                         "(defaults to --ft_lr)")
+    p.add_argument("--ft_lr_mode", type=str, default="const",
+                   choices=["const", "relative"],
+                   help="'const' gives every tensor --ft_lr. 'relative' gives each "
+                        "tensor lr = --ft_rel_lr * rms(W), so every tensor moves the "
+                        "same *fraction* of its own size per step")
+    p.add_argument("--ft_rel_lr", type=float, default=3e-5,
+                   help="only with --ft_lr_mode relative. Each weight may move about "
+                        "rel_lr * (samples * epochs) times its own RMS per window; "
+                        "3e-5 with 128 samples and 2 epochs is ~0.8%% per window")
     p.add_argument("--ft_clip_grad", type=float, default=0.0,
                    help="max grad-norm for Stage 3; 0 disables. Single-sample loss spikes "
                         "of 1e6 have been observed in the deep windows, so 1.0 is a "
