@@ -5,6 +5,7 @@ __pycache__/
 # experiment outputs
 results/
 runs/
+figs/
 *.log
 *.pt
 *.csv
@@ -13,3 +14,7 @@ runs/
 .vscode/
 .idea/
 .DS_Store
+analyze_activations.py
+plot_depth_compare.py
+plot_tail_overlay.py
+report_channels.py
