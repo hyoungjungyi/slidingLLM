@@ -18,3 +18,6 @@ analyze_activations.py
 plot_depth_compare.py
 plot_tail_overlay.py
 report_channels.py
+
+# launcher scripts stay local
+*.sh
