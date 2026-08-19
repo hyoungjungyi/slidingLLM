@@ -425,7 +425,7 @@ def run(args):
     calib_ids = data_utils.get_calib_input_ids(
         tokenizer, nsamples=args.nsamples, seqlen=args.seqlen, seed=args.seed,
         dataset=args.calib_dataset, data_root=args.data_root)
-    sw_ids = calib_ids[:args.sw_nsamples]
+    sw_ids = calib_ids
 
     timings = {}
     explicit = [int(c) for c in args.mass_channels.split(",") if c.strip() != ""]
@@ -594,7 +594,6 @@ def build_parser():
 
     # calibration
     p.add_argument("--nsamples", type=int, default=128)
-    p.add_argument("--sw_nsamples", type=int, default=128)
     p.add_argument("--calib_dataset", type=str, default="wikitext2")
     p.add_argument("--data_root", type=str,
                    default="/home/kangeunjeon/geontack_kairi/data")
