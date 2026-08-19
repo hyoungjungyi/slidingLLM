@@ -941,8 +941,8 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
         # Teacher layers still run exactly once per pass (`tasks` is
         # non-decreasing in the start block, so the teacher only ever moves
         # forward), but holding all 32 exits at once costs
-        # sw_nsamples*seqlen*hidden*2 bytes each — 132 GiB of host RAM at
-        # sw_nsamples=256, which does not fit beside a second run on a shared
+        # nsamples*seqlen*hidden*2 bytes each — 132 GiB of host RAM at
+        # nsamples=256, which does not fit beside a second run on a shared
         # box. A task at block `i` never looks further back than exit i-1, so
         # everything below that is dropped as the window advances: peak RAM is
         # O(window) caches instead of O(num_layers).
@@ -1101,7 +1101,7 @@ def run(args):
     calib_ids = data_utils.get_calib_input_ids(
         tokenizer, nsamples=args.nsamples, seqlen=args.seqlen, seed=args.seed,
         dataset=args.calib_dataset, data_root=args.data_root)
-    sw_ids = calib_ids[:args.sw_nsamples]
+    sw_ids = calib_ids
 
     timings = {}
     teacher = None
@@ -1273,10 +1273,9 @@ def build_parser():
     p.add_argument("--data_root", type=str, default=data_utils.DEFAULT_DATA_ROOT)
     p.add_argument("--calib_dataset", type=str, default="wikitext2")
     p.add_argument("--eval_datasets", type=str, default="wikitext2")
-    p.add_argument("--nsamples", type=int, default=128, help="sequences for the whitening covariance")
-    p.add_argument("--sw_nsamples", type=int, default=128,
-                   help="sequences for stages 1-3 (the first --sw_nsamples of the "
-                        "--nsamples calibration set; all three stages see the same ones)")
+    p.add_argument("--nsamples", type=int, default=128,
+                   help="calibration sequences; the same set feeds the whitening "
+                        "covariance and stages 1-3")
     p.add_argument("--calib_batch_size", type=int, default=1)
     p.add_argument("--sw_batch_size", type=int, default=1)
     p.add_argument("--stage1_batch_size", type=int, default=1)
