@@ -1161,6 +1161,19 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                 gc.collect()
                 torch.cuda.empty_cache()
 
+        # Fold this pass's adapters into the weights before the next pass, so
+        # pass 2 sees pass 1's result as plain weights and the saved model keeps
+        # exactly the parameter count Stage 2 sliced it down to.
+        if adapters:
+            n = merge_lora(student_layers)
+            print(f"[stage3] merged {n} LoRA adapters into the base weights")
+        del adapters
+
+        pass_avgs.append(sum(losses) / max(1, len(losses)))
+        if len(phases) > 1:
+            print(f"[stage3] pass {ph + 1} mean window mse {pass_avgs[-1]:.6f}")
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # The last pass's mean is the training loss of the weights we ship.
     return pass_avgs[-1]
