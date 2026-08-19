@@ -107,8 +107,9 @@ def get_alpaca_input_ids(tokenizer, seqlen=256, max_samples=None, data_root=DEFA
     
     cache_dir = os.path.join(data_root, "alpaca")
     os.makedirs(cache_dir, exist_ok=True)
-    tag = getattr(tokenizer, "name_or_path", "tok")
+    tag = getattr(tokenizer, "name_or_path", "tok").replace("/", "_")
     cache_path = os.path.join(cache_dir, f"tokens_alpaca_{tag}_{seqlen}.pt")
+    os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
     
     if os.path.exists(cache_path):
         ids = torch.load(cache_path)
