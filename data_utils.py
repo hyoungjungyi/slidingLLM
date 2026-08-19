@@ -93,3 +93,69 @@ def get_test_input_ids(tokenizer, seqlen=2048, dataset="wikitext2",
     ids = get_token_stream(tokenizer, dataset, "test", data_root)
     n = ids.shape[0] // seqlen
     return ids[: n * seqlen].view(n, seqlen)
+
+
+def get_alpaca_input_ids(tokenizer, seqlen=256, max_samples=None, data_root=DEFAULT_DATA_ROOT):
+    """Loads the yahma/alpaca-cleaned dataset, formats it, and tokenizes it.
+    
+    Returns a LongTensor of shape (N, seqlen) where N is the number of sequences
+    (up to max_samples, or 51760 if None). Shorter sequences are padded to seqlen,
+    longer sequences are truncated.
+    """
+    from datasets import load_dataset
+    import os
+    
+    cache_dir = os.path.join(data_root, "alpaca")
+    os.makedirs(cache_dir, exist_ok=True)
+    tag = getattr(tokenizer, "name_or_path", "tok")
+    cache_path = os.path.join(cache_dir, f"tokens_alpaca_{tag}_{seqlen}.pt")
+    
+    if os.path.exists(cache_path):
+        ids = torch.load(cache_path)
+        if max_samples is not None and ids.shape[0] > max_samples:
+            return ids[:max_samples]
+        return ids
+        
+    ds = load_dataset("yahma/alpaca-cleaned", cache_dir=cache_dir, trust_remote_code=True)
+    
+    prompt_input = (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
+    )
+    prompt_no_input = (
+        "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:\n"
+    )
+    
+    def format_prompt(example):
+        if example.get("input", "") != "":
+            prompt = prompt_input.format(instruction=example["instruction"], input=example["input"])
+        else:
+            prompt = prompt_no_input.format(instruction=example["instruction"])
+        return prompt + example["output"]
+
+    # Tokenize each example individually and pad/truncate to seqlen
+    out_ids = []
+    
+    # We want to match SVD-LLM's tokenize behavior:
+    # They do NOT pad, but wait, if we are passing batches to slidingLLM, we need a 
+    # uniform shape (N, seqlen). We must pad it to seqlen to return a single tensor.
+    # We will pad with 0 (pad_token_id) on the left (or right, doesn't matter for finetuning if attention mask handles it, 
+    # but slidingLLM doesn't use attention_mask for training loss easily! Wait, slidingLLM `run_layer` takes 
+    # `am` built via `build_decoder_kwargs`. It assumes dense rectangular arrays and builds causal masks. 
+    # Wait, sliding_llm feature_mse does not use padding mask. 
+    # The original wikitext-2 is densely packed, so there is no padding.
+    # If we want Alpaca to be densely packed, we can just concatenate everything and split into `seqlen` chunks!
+    
+    text_stream = "\n\n".join([format_prompt(ex) for ex in ds["train"]])
+    ids = tokenizer(text_stream, return_tensors="pt").input_ids[0]
+    
+    n = ids.shape[0] // seqlen
+    reshaped_ids = ids[: n * seqlen].view(n, seqlen)
+    
+    torch.save(reshaped_ids, cache_path)
+    
+    if max_samples is not None and reshaped_ids.shape[0] > max_samples:
+        return reshaped_ids[:max_samples]
+    return reshaped_ids

@@ -874,7 +874,8 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                             stage3inner=False, stage3innerpercent=False, stage3progressive=False,
                             skip_ends=0, edge="skip", edge_lr=None, clip_grad=0.0,
                             lr_mode="const", rel_lr=3e-5,
-                            uv_mode="joint", lora_r=0, lora_alpha=16.0):
+                            uv_mode="joint", lora_r=0, lora_alpha=16.0,
+                            chunk_size=1024):
     if epochs <= 0:
         print("\n[stage3] skipped (epochs=0)")
         return 0.0
@@ -935,150 +936,231 @@ def sliding_window_finetune(teacher, student, calib_ids, device, epochs=2,
                   f"| {n_p / 1e6:.1f}M trainable = {100 * n_p / n_b:.2f}% of the "
                   f"matrices they sit on | merged back at the end of the pass")
 
-        # --- teacher activations: computed once each, kept only while needed.
-        # teacher_exits[j] = teacher hidden state after layer j (before layer j+1).
-        # For window [i, i+w), the target is teacher_exits[i+w-1].
-        # Teacher layers still run exactly once per pass (`tasks` is
-        # non-decreasing in the start block, so the teacher only ever moves
-        # forward), but holding all 32 exits at once costs
-        # nsamples*seqlen*hidden*2 bytes each — 132 GiB of host RAM at
-        # nsamples=256, which does not fit beside a second run on a shared
-        # box. A task at block `i` never looks further back than exit i-1, so
-        # everything below that is dropped as the window advances: peak RAM is
-        # O(window) caches instead of O(num_layers).
-        teacher_layers = get_layers(teacher)
-        teacher_embed = HiddenCache.from_embeddings(teacher, calib_ids, device)
-        teacher_exits: dict = {}
-        t_state = {"pos": 0, "cache": teacher_embed}   # exits computed for blocks < pos
+        n_samples = calib_ids.shape[0]
+        use_chunking = n_samples > chunk_size
 
-        def teacher_exit(j):
-            """Teacher activation *leaving* block j, computing it if not cached."""
-            while t_state["pos"] <= j:
-                tlayer = teacher_layers[t_state["pos"]]
-                tlayer.to(device)
-                with torch.no_grad():
-                    t_state["cache"] = t_state["cache"].advance(
-                        tlayer, device, batch_size, kwargs_fn,
-                        desc=f"  teacher {t_state['pos']}")
-                tlayer.to("cpu")
-                teacher_exits[t_state["pos"]] = t_state["cache"]
-                t_state["pos"] += 1
-                torch.cuda.empty_cache()
-            return teacher_exits[j]
+        if not use_chunking:
+            # --- original logic for datasets that fit in RAM ---
+            teacher_layers = get_layers(teacher)
+            teacher_embed = HiddenCache.from_embeddings(teacher, calib_ids, device)
+            teacher_exits: dict = {}
+            t_state = {"pos": 0, "cache": teacher_embed}   # exits computed for blocks < pos
 
-        def release_teacher_exits(keep_from):
-            """Drop cached exits below `keep_from` — no later task asks for them."""
-            for k in [k for k in teacher_exits if k < keep_from]:
-                del teacher_exits[k]
-            gc.collect()
+            def teacher_exit(j):
+                while t_state["pos"] <= j:
+                    tlayer = teacher_layers[t_state["pos"]]
+                    tlayer.to(device)
+                    with torch.no_grad():
+                        t_state["cache"] = t_state["cache"].advance(
+                            tlayer, device, batch_size, kwargs_fn,
+                            desc=f"  teacher {t_state['pos']}")
+                    tlayer.to("cpu")
+                    teacher_exits[t_state["pos"]] = t_state["cache"]
+                    t_state["pos"] += 1
+                    torch.cuda.empty_cache()
+                return teacher_exits[j]
 
-        def teacher_in(j):
-            """Teacher activation *entering* block j — the teacher-forced input."""
-            return teacher_embed if j == 0 else teacher_exit(j - 1)
+            def release_teacher_exits(keep_from):
+                for k in [k for k in teacher_exits if k < keep_from]:
+                    del teacher_exits[k]
+                gc.collect()
 
-        # --- fine-tune the student window by window.
-        # s_cache is advanced incrementally using already-fine-tuned student
-        # layers, so later windows see corrected inputs from earlier blocks. It
-        # is rebuilt per pass, so pass 2 starts from everything pass 1 changed.
-        s_cache = HiddenCache.from_embeddings(student, calib_ids, device)
-        s_pos = 0
+            def teacher_in(j):
+                return teacher_embed if j == 0 else teacher_exit(j - 1)
 
-        losses = []
-        for w_idx, (i, w, mode) in enumerate(tasks):
-            # Advance student cache to the start of this window.
-            while s_pos < i:
-                student_layers[s_pos].to(device)
-                with torch.no_grad():
-                    s_cache = s_cache.advance(student_layers[s_pos], device,
-                                              batch_size, kwargs_fn)
-                student_layers[s_pos].to("cpu")
-                s_pos += 1
-                torch.cuda.empty_cache()
+            s_cache = HiddenCache.from_embeddings(student, calib_ids, device)
+            s_pos = 0
+            losses = []
 
-            release_teacher_exits(i - 1)
-            target = teacher_exit(i + w - 1)
-            # "individual" feeds the teacher's own activation in, so the block is
-            # fit locally with no upstream drift to absorb; "sliding" feeds the
-            # student's accumulated activation, which is what makes the window
-            # error-correcting.
-            src = teacher_in(i) if mode == "individual" else s_cache
-            tag = "block " if mode == "individual" else "window"
+            for w_idx, (i, w, mode) in enumerate(tasks):
+                while s_pos < i:
+                    student_layers[s_pos].to(device)
+                    with torch.no_grad():
+                        s_cache = s_cache.advance(student_layers[s_pos], device,
+                                                  batch_size, kwargs_fn)
+                    student_layers[s_pos].to("cpu")
+                    s_pos += 1
+                    torch.cuda.empty_cache()
 
-            blocks = [student_layers[j] for j in range(i, i + w)]
-            for blk in blocks:
-                blk.to(device)
+                release_teacher_exits(i - 1)
+                target = teacher_exit(i + w - 1)
+                src = teacher_in(i) if mode == "individual" else s_cache
+                tag = "block " if mode == "individual" else "window"
 
-            # With adapters attached they are the only trainable tensors, and
-            # they only exist on this pass's half, so selecting them is enough.
-            if lora_r > 0:
-                lmods = [m for blk in blocks for m in blk.modules()
-                         if isinstance(m, LoRALinear)]
-                params = [p for m in lmods for p in (m.lora_A, m.lora_B)]
-            else:
-                lmods = []
-                params = [p for blk in blocks
-                          for name, p in blk.named_parameters()
-                          if any(t in name for t in targets)]
-            if not params:
+                blocks = [student_layers[j] for j in range(i, i + w)]
                 for blk in blocks:
-                    blk.to("cpu")
-                continue
-            for p in params:
-                p.requires_grad_(True)
-            task_lr = edge_lr if mode == "individual" else lr
-            opt = (build_lora_optimizer(lmods, lr_mode, task_lr, rel_lr, weight_decay)
-                   if lora_r > 0 else
-                   build_ft_optimizer(params, lr_mode, task_lr, rel_lr, weight_decay))
+                    blk.to(device)
 
-            last = 0.0
-            for ep in range(epochs):
-                tot = 0.0
-                nb = 0
-                pbar = tqdm(range(0, len(src), batch_size),
-                            desc=f"  {tag} {w_idx}/{len(tasks)-1} [{i}:{i+w}] ep{ep+1}",
-                            leave=False)
-                for b in pbar:
-                    x = src.data[b:b + batch_size].to(device)
-                    t = target.data[b:b + batch_size].to(device)
-                    am, pid = kwargs_fn(x.shape[0])
+                if lora_r > 0:
+                    lmods = [m for blk in blocks for m in blk.modules()
+                             if isinstance(m, LoRALinear)]
+                    params = [p for m in lmods for p in (m.lora_A, m.lora_B)]
+                else:
+                    lmods = []
+                    params = [p for blk in blocks
+                              for name, p in blk.named_parameters()
+                              if any(t in name for t in targets)]
+                if not params:
                     for blk in blocks:
-                        x = run_layer(blk, x, am, pid)
-                    loss = feature_mse(x, t, rel_mse)
-                    opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    if clip_grad > 0:
-                        torch.nn.utils.clip_grad_norm_(params, clip_grad)
-                    opt.step()
-                    tot += loss.item()
-                    nb += 1
-                    pbar.set_postfix(mse=f"{loss.item():.5f}")
-                last = tot / max(1, nb)
-                print(f"  {tag} {w_idx:>2} [{i}:{i+w}] ({mode[:4]}) "
-                      f"pass {ph + 1} epoch {ep + 1}/{epochs} | mse {last:.6f}")
-            losses.append(last)
+                        blk.to("cpu")
+                    continue
+                for p in params:
+                    p.requires_grad_(True)
+                task_lr = edge_lr if mode == "individual" else lr
+                opt = (build_lora_optimizer(lmods, lr_mode, task_lr, rel_lr, weight_decay)
+                       if lora_r > 0 else
+                       build_ft_optimizer(params, lr_mode, task_lr, rel_lr, weight_decay))
 
-            for blk in blocks:
-                for p in blk.parameters():
-                    p.requires_grad_(False)
-                blk.to("cpu")
-            del opt, params, lmods
-            gc.collect()
-            torch.cuda.empty_cache()
+                last = 0.0
+                for ep in range(epochs):
+                    tot = 0.0
+                    nb = 0
+                    pbar = tqdm(range(0, len(src), batch_size),
+                                desc=f"  {tag} {w_idx}/{len(tasks)-1} [{i}:{i+w}] ep{ep+1}",
+                                leave=False)
+                    for b in pbar:
+                        x = src.data[b:b + batch_size].to(device)
+                        t = target.data[b:b + batch_size].to(device)
+                        am, pid = kwargs_fn(x.shape[0])
+                        for blk in blocks:
+                            x = run_layer(blk, x, am, pid)
+                        loss = feature_mse(x, t, rel_mse)
+                        opt.zero_grad(set_to_none=True)
+                        loss.backward()
+                        if clip_grad > 0:
+                            torch.nn.utils.clip_grad_norm_(params, clip_grad)
+                        opt.step()
+                        tot += loss.item()
+                        nb += 1
+                        pbar.set_postfix(mse=f"{loss.item():.5f}")
+                    last = tot / max(1, nb)
+                    print(f"  {tag} {w_idx:>2} [{i}:{i+w}] ({mode[:4]}) "
+                          f"pass {ph + 1} epoch {ep + 1}/{epochs} | mse {last:.6f}")
+                losses.append(last)
 
-        # Fold this pass's adapters into the weights before the next pass, so
-        # pass 2 sees pass 1's result as plain weights and the saved model keeps
-        # exactly the parameter count Stage 2 sliced it down to.
-        if adapters:
-            n = merge_lora(student_layers)
-            print(f"[stage3] merged {n} LoRA adapters into the base weights")
-        del adapters
+                for blk in blocks:
+                    for p in blk.parameters():
+                        p.requires_grad_(False)
+                    blk.to("cpu")
+                del opt, params, lmods
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        pass_avgs.append(sum(losses) / max(1, len(losses)))
-        if len(phases) > 1:
-            print(f"[stage3] pass {ph + 1} mean window mse {pass_avgs[-1]:.6f}")
-        del s_cache, teacher_exits, teacher_embed, t_state
-        gc.collect()
-        torch.cuda.empty_cache()
+            del s_cache, teacher_exits, teacher_embed, t_state
+            
+        else:
+            # --- chunking logic for large datasets (e.g. 50k alpaca) ---
+            print(f"[stage3] calib_ids size {n_samples} > chunk_size {chunk_size}. Using on-the-fly chunking to prevent OOM.")
+            teacher_layers = get_layers(teacher)
+            n_chunks = (n_samples + chunk_size - 1) // chunk_size
+            losses = []
+
+            for w_idx, (i, w, mode) in enumerate(tasks):
+                tag = "block " if mode == "individual" else "window"
+                blocks = [student_layers[j] for j in range(i, i + w)]
+                for blk in blocks:
+                    blk.to(device)
+
+                if lora_r > 0:
+                    lmods = [m for blk in blocks for m in blk.modules()
+                             if isinstance(m, LoRALinear)]
+                    params = [p for m in lmods for p in (m.lora_A, m.lora_B)]
+                else:
+                    lmods = []
+                    params = [p for blk in blocks
+                              for name, p in blk.named_parameters()
+                              if any(t in name for t in targets)]
+                if not params:
+                    for blk in blocks:
+                        blk.to("cpu")
+                    continue
+                for p in params:
+                    p.requires_grad_(True)
+                task_lr = edge_lr if mode == "individual" else lr
+                opt = (build_lora_optimizer(lmods, lr_mode, task_lr, rel_lr, weight_decay)
+                       if lora_r > 0 else
+                       build_ft_optimizer(params, lr_mode, task_lr, rel_lr, weight_decay))
+
+                last = 0.0
+                for ep in range(epochs):
+                    tot = 0.0
+                    nb = 0
+                    
+                    # Optional: randomly shuffle indices for the epoch
+                    # SVD-LLM doesn't shuffle the validation set, but trains on shuffled data.
+                    # We will just process chunks sequentially as they are already shuffled in data_utils.
+                    pbar = tqdm(total=n_samples, desc=f"  {tag} {w_idx}/{len(tasks)-1} [{i}:{i+w}] ep{ep+1}", leave=False)
+                    
+                    for chunk_idx in range(n_chunks):
+                        start = chunk_idx * chunk_size
+                        end = min(start + chunk_size, n_samples)
+                        chunk_ids = calib_ids[start:end]
+                        
+                        # 1. Compute teacher target
+                        t_cache = HiddenCache.from_embeddings(teacher, chunk_ids, device)
+                        for j in range(i + w):
+                            tlayer = teacher_layers[j]
+                            tlayer.to(device)
+                            with torch.no_grad():
+                                t_cache = t_cache.advance(tlayer, device, batch_size, kwargs_fn)
+                            tlayer.to("cpu")
+                        target = t_cache
+                        
+                        # 2. Compute student entry
+                        if mode == "individual":
+                            s_cache = HiddenCache.from_embeddings(teacher, chunk_ids, device)
+                            for j in range(i):
+                                tlayer = teacher_layers[j]
+                                tlayer.to(device)
+                                with torch.no_grad():
+                                    s_cache = s_cache.advance(tlayer, device, batch_size, kwargs_fn)
+                                tlayer.to("cpu")
+                            src = s_cache
+                        else:
+                            s_cache = HiddenCache.from_embeddings(student, chunk_ids, device)
+                            for j in range(i):
+                                slayer = student_layers[j]
+                                slayer.to(device)
+                                with torch.no_grad():
+                                    s_cache = s_cache.advance(slayer, device, batch_size, kwargs_fn)
+                                slayer.to("cpu")
+                            src = s_cache
+                        
+                        # 3. Train on chunk
+                        for b in range(0, len(src), batch_size):
+                            x = src.data[b:b + batch_size].to(device)
+                            t = target.data[b:b + batch_size].to(device)
+                            am, pid = kwargs_fn(x.shape[0])
+                            for blk in blocks:
+                                x = run_layer(blk, x, am, pid)
+                            loss = feature_mse(x, t, rel_mse)
+                            opt.zero_grad(set_to_none=True)
+                            loss.backward()
+                            if clip_grad > 0:
+                                torch.nn.utils.clip_grad_norm_(params, clip_grad)
+                            opt.step()
+                            tot += loss.item()
+                            nb += 1
+                            
+                        pbar.update(end - start)
+                        pbar.set_postfix(mse=f"{tot / max(1, nb):.5f}")
+                        del t_cache, s_cache, target, src
+                        torch.cuda.empty_cache()
+                        
+                    last = tot / max(1, nb)
+                    pbar.close()
+                    print(f"  {tag} {w_idx:>2} [{i}:{i+w}] ({mode[:4]}) "
+                          f"pass {ph + 1} epoch {ep + 1}/{epochs} | mse {last:.6f}")
+                losses.append(last)
+
+                for blk in blocks:
+                    for p in blk.parameters():
+                        p.requires_grad_(False)
+                    blk.to("cpu")
+                del opt, params, lmods
+                gc.collect()
+                torch.cuda.empty_cache()
+
 
     # The last pass's mean is the training loss of the weights we ship.
     return pass_avgs[-1]
@@ -1196,11 +1278,16 @@ def _finish(args, student, tokenizer, teacher, Q, sw_ids, timings, device):
     if not args.skip_stage3 and args.stage3_epochs > 0:
         if teacher is None:
             teacher, _ = load_llm(args.model_id, args.dtype, args.seqlen)
-            rotation.apply_rotation(teacher, args.rotate, args.rotate_seed, device, Q=Q)
+        if args.ft_dataset == "alpaca":
+            print(f"\n[stage3] loading alpaca dataset (seqlen 256) for fine-tuning")
+            ft_ids = data_utils.get_alpaca_input_ids(tokenizer, seqlen=256, data_root=args.data_root)
+        else:
+            ft_ids = sw_ids
+
         with Timer() as t:
             wd = 0.0 if args.disable_ft_weight_decay else 0.01
             avg_mse = sliding_window_finetune(
-                teacher, student, sw_ids, device, epochs=args.stage3_epochs,
+                teacher, student, ft_ids, device, epochs=args.stage3_epochs,
                 window=args.window, stride=args.stride, lr=args.ft_lr,
                 batch_size=args.sw_batch_size, rel_mse=args.rel_mse,
                 weight_decay=wd, stage3inner=args.stage3inner,
@@ -1211,7 +1298,8 @@ def _finish(args, student, tokenizer, teacher, Q, sw_ids, timings, device):
                 clip_grad=args.ft_clip_grad,
                 lr_mode=args.ft_lr_mode, rel_lr=args.ft_rel_lr,
                 uv_mode=args.stage3_uv_mode, lora_r=args.stage3_lora_r,
-                lora_alpha=args.stage3_lora_alpha)
+                lora_alpha=args.stage3_lora_alpha,
+                chunk_size=args.ft_chunk_size)
         timings["stage3_finetune"] = t.elapsed
 
     del teacher, Q
@@ -1333,6 +1421,15 @@ def build_parser():
     p.add_argument("--stage3_lora_alpha", type=float, default=16.0,
                    help="LoRA scaling is alpha/r; 16 with r=8 reproduces "
                         "SVD-LLM's 2.0")
+    p.add_argument("--ft_dataset", type=str, default="wikitext2",
+                   choices=["wikitext2", "alpaca"],
+                   help="Dataset to use for Stage 3 fine-tuning. 'wikitext2' reuses "
+                        "the Stage 0-2 calibration samples. 'alpaca' loads the "
+                        "yahma/alpaca-cleaned dataset.")
+    p.add_argument("--ft_chunk_size", type=int, default=1024,
+                   help="Number of sequences to process at a time during Stage 3 "
+                        "fine-tuning. Prevents Host RAM OOM when using large "
+                        "datasets like alpaca.")
     p.add_argument("--ft_clip_grad", type=float, default=0.0,
                    help="max grad-norm for Stage 3; 0 disables. Single-sample loss spikes "
                         "of 1e6 have been observed in the deep windows, so 1.0 is a "
