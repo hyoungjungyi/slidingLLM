@@ -9,7 +9,7 @@ covariance `M = X^T X`, so the whitened SVD of Stage 0 spends essentially all of
 its dynamic range reproducing them, and the singular directions that matter for
 the other 4,094 channels get truncated first.
 
-So take them out of the optimisation entirely. For a linear `W` (out, in) with
+So take them out of the factorisation entirely. For a linear `W` (out, in) with
 massive input channels `C` and the rest `K`:
 
     y = W x = W[:, K] x_K  +  W[:, C] x_C
@@ -18,39 +18,26 @@ massive input channels `C` and the rest `K`:
 
 The split is *algebraically exact* -- no approximation is introduced by it. Only
 the `W[:, K]` half is whitened (eigendecomposition of the reduced covariance
-`M_KK`), factored by SVD, truncated, and fine-tuned. `W[:, C]` is carried along
-at full precision as a frozen `(out, |C|)` slab and is never touched.
+`M_KK`), factored by SVD, searched for optimal ranks (Stages 1 & 2), truncated,
+and fine-tuned (Stage 3). `W[:, C]` is carried along at full precision as a
+frozen `(out, |C|)` slab and is never touched.
 
-Note that "add the massive channels back in for evaluation" is *not* a separate
-step at the end: the exact branch is part of the forward pass throughout, so the
-Stage-3 windows are fit against the true layer output rather than against a
-mutilated one. Dropping the branch during fine-tuning and re-adding it after
-would train the low-rank half to compensate for a missing term and then
-double-count it, which is strictly worse -- hence it is not offered here.
-
-Cost of keeping `W[:, C]` dense: `|C| * (out - r)` extra parameters per linear,
-about +0.04% of the dense linear budget at |C| = 2. `--match_ratio` shrinks the
-ranks to absorb even that, if an exactly ratio-matched comparison is wanted.
-
-Reusing Stage 2
----------------
-`ckpt/r0.6_stage2_resume.pt` holds the per-singular-value gate logits `Z`, not
-weights. Those logits index the singular values of `W R` in the *full-channel*
-whitened basis; once `C` is removed the covariance, the whitening `R` and the
-whole singular basis change, so `Z` cannot be copied over element-wise.
-
-What does transfer is the number it implies: `r_i = (Z_i > 0).sum()`, the rank
-Stage 2 allocated to linear `i`. Seeding the reduced-channel SVD with those
-ranks reproduces Stage 2's *allocation* across layers -- which is the expensive
-part, and the part being held fixed for the comparison -- without re-running it.
-That is what `--stage2_ranks` does.
+Full multi-stage pipeline
+-------------------------
+  Stage 0  Isolate outlier channels C into W_mass; compute whitened SVD on
+           the remaining normal channels K; wrap into `MassiveSplitGateLinear`.
+  Stage 1  Global rank search (continuous rank k per linear).
+  Stage 2  Sliding-window rank search (per-singular-value sigmoid gates Z_i).
+  Slice    Hard-truncate W_u, W_v using exact learned singular-value masks (Z > 0)
+           into `MassiveSplitLinear`.
+  Stage 3  Sliding-window fine-tuning of the truncated W_u, W_v.
 
 Example
 -------
-  python massive_split.py --ratio 0.6 --device cuda:6 \
-      --stage2_ranks ckpt/r0.6_stage2_resume.pt \
-      --mass_channels 2533,1415 \
-      --out_json results/r0.6_masssplit.json
+  # Full end-to-end pipeline with auto outlier detection:
+  python massive_split.py --ratio 0.6 --device cuda:0 \\
+      --mass_scope auto --mass_topk 2 --mass_ratio_thresh 50.0 \\
+      --out_json results/r0.6_masssplit_auto.json
 """
 import argparse
 import gc
@@ -69,7 +56,10 @@ from llm_utils import (HiddenCache, Timer, build_decoder_kwargs, evaluate_ppl,
                        get_layers, get_module, layer_linear_paths, load_llm,
                        param_report, run_layer, save_result, seed_everything,
                        set_module)
-from sliding_llm import sliding_window_finetune
+from sliding_llm import (SVDGateLinear, global_rank_search, hard_size_ratio,
+                         iter_gates, sliding_window_finetune,
+                         sliding_window_rank_search, soft_size_ratio,
+                         teacher_final_hidden)
 
 # Linears whose input is the residual stream (through an RMSNorm, which is a
 # per-channel rescale and so preserves the channel indexing). Only these can be
@@ -81,7 +71,7 @@ RESIDUAL_FED = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
 
 
 # ==========================================================================
-# 1. The split linear
+# 1. The split linear modules
 # ==========================================================================
 class MassiveSplitLinear(nn.Module):
     """`fc_v -> fc_u` on the ordinary channels, plus an exact dense slab on `C`.
@@ -126,6 +116,61 @@ class MassiveSplitLinear(nn.Module):
             return self.fc_u(self.fc_v(x))
         y = self.fc_u(self.fc_v(x.index_select(-1, self.keep_idx)))
         return y + F.linear(x.index_select(-1, self.mass_idx), self.W_mass)
+
+
+class MassiveSplitGateLinear(SVDGateLinear):
+    """Gated low-rank SVD on normal channels K plus an exact dense slab on outlier channels C.
+
+    Inherits from SVDGateLinear so all of Stage 1 (global_rank_search) and
+    Stage 2 (sliding_window_rank_search) work directly without modifications.
+    """
+
+    def __init__(self, W_u, W_v, W_mass, bias, keep_idx, mass_idx, in_features,
+                 init_k, beta=0.1, temperature=10.0, z_slope=0.1):
+        super().__init__(W_u, W_v, bias, init_k, beta, temperature, z_slope)
+        self.in_features = in_features
+        self.n_mass = 0 if mass_idx is None else int(mass_idx.numel())
+
+        if self.n_mass:
+            self.W_mass = nn.Parameter(W_mass, requires_grad=False)
+            self.register_buffer("mass_idx", mass_idx)
+            self.register_buffer("keep_idx", keep_idx)
+        else:
+            self.register_parameter("W_mass", None)
+            self.register_buffer("mass_idx", None)
+            self.register_buffer("keep_idx", None)
+
+    def dense_size(self):
+        return self.in_features * self.out_features
+
+    def soft_size(self):
+        normal_in = self.in_features - self.n_mass
+        return self.get_mask().sum() * (normal_in + self.out_features) + (self.out_features * self.n_mass)
+
+    def hard_size(self):
+        normal_in = self.in_features - self.n_mass
+        return self.hard_rank() * (normal_in + self.out_features) + (self.out_features * self.n_mass)
+
+    def forward(self, x):
+        mask = self.get_mask()
+        if self.n_mass == 0:
+            h = F.linear(x, self.W_v)
+            if mask.requires_grad:
+                h = (h.float() * mask).to(self.W_u.dtype)
+            else:
+                h = h * mask.to(h.dtype)
+            return F.linear(h, self.W_u, self.bias)
+        else:
+            x_k = x.index_select(-1, self.keep_idx)
+            h = F.linear(x_k, self.W_v)
+            if mask.requires_grad:
+                h = (h.float() * mask).to(self.W_u.dtype)
+            else:
+                h = h * mask.to(h.dtype)
+            y_k = F.linear(h, self.W_u, self.bias)
+            x_c = x.index_select(-1, self.mass_idx)
+            y_c = F.linear(x_c, self.W_mass)
+            return y_k + y_c
 
 
 def iter_split_linears(model):
@@ -185,18 +230,14 @@ def whiten_eig(M, damp, eig_device, eig_dtype):
 
 
 # ==========================================================================
-# 4. Build the split student
+# 4. Build the gated split student (Stage 0)
 # ==========================================================================
 @torch.no_grad()
-def build_split_student(model, calib_ids, device, ranks, batch_size=1,
-                        explicit=(), topk=0, ratio_thresh=50.0, scope="residual",
-                        damp=1e-6, eig_device="same", eig_dtype="float64"):
-    """Replace every target Linear with a `MassiveSplitLinear`, block by block.
-
-    One dense sequential pass: each block's forward both collects the per-linear
-    input covariance and produces the input activations for the next block, so
-    the dense model is never fully resident on the GPU.
-    """
+def build_split_gated_student(model, calib_ids, device, init_ratio=0.6, batch_size=1,
+                              explicit=(), topk=0, ratio_thresh=50.0, scope="residual",
+                              damp=1e-6, eig_device="same", eig_dtype="float64",
+                              beta=0.1, temperature=10.0, z_slope=0.1, custom_ranks=None):
+    """Replace every target Linear with a `MassiveSplitGateLinear`, block by block."""
     layers = get_layers(model)
     dtype = next(model.parameters()).dtype
     seqlen = calib_ids.shape[1]
@@ -207,7 +248,7 @@ def build_split_student(model, calib_ids, device, ranks, batch_size=1,
             kwargs_cache[bs] = build_decoder_kwargs(seqlen, dtype, device, bs)
         return kwargs_cache[bs]
 
-    print(f"[split] embedding {calib_ids.shape[0]} calibration sequences")
+    print(f"[stage0] embedding {calib_ids.shape[0]} calibration sequences")
     cache = HiddenCache.from_embeddings(model, calib_ids, device)
 
     meta = {}
@@ -255,7 +296,7 @@ def build_split_student(model, calib_ids, device, ranks, batch_size=1,
             keep[C] = False
             K = torch.nonzero(keep).squeeze(-1)
 
-            # Reduced covariance / weight: the massive columns leave the problem.
+            # Reduced covariance & SVD on normal channels only
             M = (cov[p].index_select(0, K).index_select(1, K) / max(1, ntok[p])).double()
             R, Rinv, cond, n_damped = whiten_eig(M, damp, eig_device, eig_dtype)
             del M
@@ -266,55 +307,86 @@ def build_split_student(model, calib_ids, device, ranks, batch_size=1,
             Rinv = Rinv.to(device=device, dtype=torch.float32)
             U, S, Vt = torch.linalg.svd(W_r @ R, full_matrices=False)
 
-            r = int(min(ranks[gi], S.shape[0]))
-            r = max(1, r)
-            sq = S[:r].clamp_min(0).sqrt()
-            W_u = U[:, :r] * sq                             # (out, r)
-            W_v = sq.unsqueeze(1) * (Vt[:r] @ Rinv)         # (r, in - |C|)
+            sqrt_s = S.clamp_min(0).sqrt()
+            W_u = U * sqrt_s                                      # (out, r_max)
+            W_v = sqrt_s.unsqueeze(1) * (Vt @ Rinv)              # (r_max, in - |C|)
 
-            new = MassiveSplitLinear(W_v.to(dtype), W_u.to(dtype),
-                                     None if W_c is None else W_c.to(dtype),
-                                     None if bias is None else bias.to(dtype),
-                                     K, C if C.numel() else None, d_in)
+            n_mass = C.numel()
+            normal_in = d_in - n_mass
+            if custom_ranks is not None:
+                k_val = custom_ranks[gi]
+            else:
+                k_val = max(1, round((init_ratio * d_in * d_out - d_out * n_mass) / (normal_in + d_out)))
+            k_val = min(k_val, S.shape[0])
+
+            new = MassiveSplitGateLinear(
+                W_u.to(dtype), W_v.to(dtype),
+                None if W_c is None else W_c.to(dtype),
+                None if bias is None else bias.to(dtype),
+                K, C if C.numel() else None, d_in,
+                init_k=k_val, beta=beta, temperature=temperature,
+                z_slope=z_slope).to(device)
             set_module(layer, p, new)
-            meta[f"{li}.{p}"] = {"rank": r, "mass": [int(c) for c in C.tolist()],
-                                 "in": d_in, "out": d_out}
-            if li == 0 or (li == len(layers) - 1):
-                tail = float(S[r:].pow(2).sum() / S.pow(2).sum().clamp_min(1e-30))
-                print(f"  L{li:>2} {p:<18} r={r:<5} |C|={C.numel()} "
-                      f"cond={cond:.2e} damped={n_damped} tail_energy={tail:.4f} "
-                      f"mass={C.tolist()}")
-
-            cov[p] = None
-            gi += 1
-            del W, W_r, W_c, U, S, Vt, sq, W_u, W_v, R, Rinv
+            meta[f"{li}.{p}"] = {"init_k": k_val, "mass": [int(c) for c in C.tolist()],
+                                 "in": d_in, "out": d_out, "cond": cond, "damped": n_damped}
+            del W, W_r, W_c, U, S, Vt, sqrt_s, W_u, W_v, R, Rinv
             torch.cuda.empty_cache()
+            gi += 1
 
         layer.to("cpu")
         cache = HiddenCache(outs)
         del cov, outs
         gc.collect()
         torch.cuda.empty_cache()
+
         el = time.time() - t0
-        print(f"[split] layer {li+1}/{len(layers)} done "
+        print(f"  block {li:>2}/{len(layers)-1} whitened SVD + split "
               f"({el:.0f}s elapsed, ~{el/(li+1)*(len(layers)-li-1):.0f}s left)", flush=True)
 
-    if gi != len(ranks):
-        raise ValueError(f"consumed {gi} ranks but was given {len(ranks)}")
     return model, meta
 
 
 # ==========================================================================
-# 5. Ranks
+# 5. Slicing with learned singular-value masks
+# ==========================================================================
+@torch.no_grad()
+def slice_split_ranks(student):
+    """Hard-truncate each MassiveSplitGateLinear into a MassiveSplitLinear using learned active indices."""
+    print("\n[slice] materialising learned ranks into MassiveSplitLinear")
+    meta = {}
+    for li, layer in enumerate(get_layers(student)):
+        for path in layer_linear_paths(layer):
+            m = get_module(layer, path)
+            if not isinstance(m, MassiveSplitGateLinear):
+                continue
+            idx = m.active_indices().to(m.W_u.device)
+            W_u = m.W_u.data[:, idx].clone()
+            W_v = m.W_v.data[idx, :].clone()
+            W_mass = m.W_mass.data.clone() if m.n_mass else None
+            bias = m.bias.data.clone() if m.bias is not None else None
+            r = W_u.shape[1]
+            dtype, dev = W_u.dtype, W_u.device
+
+            new = MassiveSplitLinear(
+                W_v, W_u, W_mass, bias,
+                m.keep_idx, m.mass_idx, m.in_features).to(device=dev, dtype=dtype)
+            set_module(layer, path, new)
+            meta[f"{li}.{path}"] = {
+                "rank": r,
+                "mass": [int(c) for c in m.mass_idx.tolist()] if m.n_mass else [],
+                "in": m.in_features,
+                "out": m.out_features,
+            }
+            del m
+        gc.collect()
+    return student, meta
+
+
+# ==========================================================================
+# 6. Rank utilities & planning
 # ==========================================================================
 def ranks_from_stage2(path):
-    """Per-linear rank implied by Stage 2's gate logits: `(Z > 0).sum()`.
-
-    `iter_gates` walks layers in forward order and, within a layer,
-    `layer.modules()` order -- which for a Llama block is q, k, v, o, gate, up,
-    down, exactly `layer_linear_paths` order. So the list lines up index for
-    index with the walk in `build_split_student`.
-    """
+    """Per-linear rank implied by Stage 2's gate logits: `(Z > 0).sum()`."""
     ck = torch.load(path, map_location="cpu")
     if "Z" not in ck:
         raise ValueError(f"{path} has no 'Z' (keys: {list(ck)}) — not a Stage-2 resume ckpt")
@@ -332,12 +404,7 @@ def uniform_ranks(model, ratio):
 
 
 def plan_shapes(model, explicit, topk, scope):
-    """(in, out, |C|) per linear, using only shapes — for the ratio arithmetic.
-
-    `|C|` is exact for the explicit residual channels and an upper bound for the
-    auto-detected ones (a channel is dropped if it fails `--mass_ratio_thresh`),
-    so `--match_ratio` may end up marginally *under* target rather than over.
-    """
+    """(in, out, |C|) per linear, using only shapes — for ratio arithmetic."""
     out = []
     for layer in get_layers(model):
         for p in layer_linear_paths(layer):
@@ -376,7 +443,7 @@ def match_ratio(shapes, ranks, target, tol=1e-5):
 
 
 # ==========================================================================
-# 6. Save / load
+# 7. Save / load
 # ==========================================================================
 def save_split(student, meta, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
@@ -412,7 +479,7 @@ def load_split(student, path):
 
 
 # ==========================================================================
-# 7. Entry point
+# 8. Entry point
 # ==========================================================================
 def run(args):
     seed_everything(args.seed)
@@ -436,79 +503,134 @@ def run(args):
             student, meta = load_split(student, args.load_split)
         timings["load_split"] = t.elapsed
         rank_src = f"loaded:{args.load_split}"
-    else:
-        # --- ranks -------------------------------------------------------
-        if args.stage2_ranks:
-            ranks, ep = ranks_from_stage2(args.stage2_ranks)
-            rank_src = f"stage2:{args.stage2_ranks}@ep{ep}"
-            print(f"\n[ranks] {len(ranks)} per-linear ranks from {args.stage2_ranks} "
-                  f"(epoch {ep}) | sum {sum(ranks)}")
-        else:
-            ranks = uniform_ranks(student, args.ratio)
-            rank_src = f"uniform:{args.ratio}"
-            print(f"\n[ranks] uniform init at ratio {args.ratio} | sum {sum(ranks)}")
+        return _finish(args, student, tokenizer, None, sw_ids, timings, device, meta, rank_src, explicit)
 
+    # --- Stage 0: Build Split Gated Student --------------------------------
+    custom_ranks = None
+    if args.stage2_ranks:
+        ranks, ep = ranks_from_stage2(args.stage2_ranks)
+        rank_src = f"stage2:{args.stage2_ranks}@ep{ep}"
+        print(f"\n[ranks] loaded {len(ranks)} per-linear ranks from {args.stage2_ranks} (epoch {ep})")
         shapes = plan_shapes(student, explicit, args.mass_topk, args.mass_scope)
-        if len(shapes) != len(ranks):
-            raise ValueError(f"{len(ranks)} ranks vs {len(shapes)} linears")
-        pred = realized_ratio(shapes, ranks)
-        base = sum(min(r, min(o, i)) * (i + o) for (i, o, _), r in zip(shapes, ranks)) \
-            / sum(i * o for i, o, _ in shapes)
-        print(f"[ranks] predicted ratio {pred:.5f} (no-split equivalent {base:.5f}, "
-              f"delta {pred-base:+.5f} from the exact massive slabs)")
         if args.match_ratio:
-            tgt = base if args.match_ratio_to < 0 else args.match_ratio_to
+            tgt = args.ratio if args.match_ratio_to < 0 else args.match_ratio_to
             ranks, alpha = match_ratio(shapes, ranks, tgt)
-            print(f"[ranks] --match_ratio: scaled by alpha={alpha:.5f} -> "
-                  f"{realized_ratio(shapes, ranks):.5f} (target {tgt:.5f})")
-            rank_src += f"|match{alpha:.4f}"
+            print(f"[ranks] --match_ratio: scaled by alpha={alpha:.5f} -> {realized_ratio(shapes, ranks):.5f}")
+        custom_ranks = ranks
+        args.skip_stage1 = args.skip_stage2 = True
+    else:
+        rank_src = f"learned:r{args.ratio}"
 
-        # --- build -------------------------------------------------------
-        print(f"\n[split] scope={args.mass_scope} explicit={explicit} "
-              f"topk={args.mass_topk} thresh={args.mass_ratio_thresh} | "
-              f"eig {args.eig_dtype} on {args.eig_device}, damp={args.damp}")
+    print(f"\n[split] scope={args.mass_scope} explicit={explicit} "
+          f"topk={args.mass_topk} thresh={args.mass_ratio_thresh} | "
+          f"eig {args.eig_dtype} on {args.eig_device}, damp={args.damp}")
+
+    with Timer() as t:
+        student, meta_pre = build_split_gated_student(
+            student, calib_ids, device, init_ratio=args.ratio,
+            batch_size=args.calib_batch_size, explicit=explicit,
+            topk=args.mass_topk, ratio_thresh=args.mass_ratio_thresh,
+            scope=args.mass_scope, damp=args.damp,
+            eig_device=args.eig_device, eig_dtype=args.eig_dtype,
+            beta=args.beta, temperature=args.temperature, z_slope=args.z_slope,
+            custom_ranks=custom_ranks)
+    timings["stage0_split_svd"] = t.elapsed
+
+    gates = list(iter_gates(student))
+    print(f"[stage0] {len(gates)} split gated linears | init hard ratio {hard_size_ratio(gates):.4f}")
+
+    # --- Stage 1: Global Rank Search --------------------------------------
+    if not args.skip_stage1 and args.stage1_epochs > 0:
+        teacher, _ = load_llm(args.model_id, args.dtype, args.seqlen)
         with Timer() as t:
-            student, meta = build_split_student(
-                student, calib_ids, device, ranks,
-                batch_size=args.calib_batch_size, explicit=explicit,
-                topk=args.mass_topk, ratio_thresh=args.mass_ratio_thresh,
-                scope=args.mass_scope, damp=args.damp,
-                eig_device=args.eig_device, eig_dtype=args.eig_dtype)
-        timings["build_split"] = t.elapsed
-        gc.collect(); torch.cuda.empty_cache()
-        if args.save_split:
-            save_split(student, meta, args.save_split)
+            tgt = teacher_final_hidden(teacher, sw_ids, device, args.sw_batch_size)
+            del teacher
+            gc.collect(); torch.cuda.empty_cache()
+            global_rank_search(student, sw_ids, tgt, device, args.ratio,
+                               epochs=args.stage1_epochs, lr=args.rank_lr,
+                               lambda_rank=args.lambda_rank, lambda_lr=args.lambda_lr,
+                               batch_size=args.stage1_batch_size, rel_mse=args.rel_mse,
+                               grad_ckpt=not args.no_grad_ckpt)
+            del tgt
+            gc.collect(); torch.cuda.empty_cache()
+        timings["stage1_global_rank"] = t.elapsed
+    else:
+        print("\n[stage1] skipped")
 
-    n_mass = sum(len(v["mass"]) for v in meta.values())
-    n_lin = sum(1 for v in meta.values() if v["mass"])
-    print(f"[split] {n_lin}/{len(meta)} linears carry an exact branch "
-          f"({n_mass} held-out channels in total)")
+    # Hand the Stage-1 allocation to Stage 2's per-singular-value gates
+    for m in gates:
+        m.to_z_mode()
+    print(f"[stage1->2] hard ratio after switching to Z gates: {hard_size_ratio(gates):.4f}")
 
-    rep = param_report(student)
-    print(f"[split] linear params {rep['linear_params']/1e9:.3f}B / "
-          f"{rep['dense_linear_params']/1e9:.3f}B = {rep['linear_param_ratio']:.5f}")
-
-    # --- Stage 3 ---------------------------------------------------------
-    avg_mse = 0.0
-    if not args.skip_stage3 and args.stage3_epochs > 0:
+    # --- Stage 2: Sliding-Window Rank Search -------------------------------
+    teacher = None
+    if not args.skip_stage2 and args.stage2_epochs > 0:
         teacher, _ = load_llm(args.model_id, args.dtype, args.seqlen)
         gc.collect(); torch.cuda.empty_cache()
         with Timer() as t:
+            sliding_window_rank_search(
+                teacher, student, sw_ids, device, args.ratio,
+                epochs=args.stage2_epochs, window=args.window, stride=args.stride,
+                stagger=args.stagger, lr=args.rank_lr, lambda_rank=args.lambda_rank,
+                lambda_lr=args.lambda_lr, batch_size=args.sw_batch_size,
+                rel_mse=args.rel_mse,
+                target_ratio_override=args.ratio if args.skip_stage1 else None,
+                ckpt_path=args.stage2_ckpt or None)
+        timings["stage2_window_rank"] = t.elapsed
+    else:
+        print("\n[stage2] skipped")
+
+    # --- Slicing: Materialize MassiveSplitLinear --------------------------
+    student, meta = slice_split_ranks(student)
+    gc.collect(); torch.cuda.empty_cache()
+    if args.save_split:
+        save_split(student, meta, args.save_split)
+
+    return _finish(args, student, tokenizer, teacher, sw_ids, timings, device, meta, rank_src, explicit)
+
+
+def _finish(args, student, tokenizer, teacher, sw_ids, timings, device, meta, rank_src, explicit):
+    """Stage 3 + evaluation + reporting."""
+    n_mass = sum(len(v["mass"]) for v in meta.values())
+    n_lin = sum(1 for v in meta.values() if v["mass"])
+    print(f"\n[split] {n_lin}/{len(meta)} linears carry an exact branch "
+          f"({n_mass} held-out channels in total)")
+
+    # --- Stage 3: Sliding-Window Fine-Tuning -------------------------------
+    avg_mse = 0.0
+    if not args.skip_stage3 and args.stage3_epochs > 0:
+        if teacher is None:
+            teacher, _ = load_llm(args.model_id, args.dtype, args.seqlen)
+        if args.ft_dataset == "alpaca":
+            print(f"\n[stage3] loading alpaca dataset (seqlen 256) for fine-tuning")
+            ft_ids = data_utils.get_alpaca_input_ids(tokenizer, seqlen=256, data_root=args.data_root)
+        else:
+            ft_ids = sw_ids
+
+        gc.collect(); torch.cuda.empty_cache()
+        with Timer() as t:
+            wd = 0.0 if args.disable_ft_weight_decay else 0.01
             avg_mse = sliding_window_finetune(
-                teacher, student, sw_ids, device, epochs=args.stage3_epochs,
+                teacher, student, ft_ids, device, epochs=args.stage3_epochs,
                 window=args.window, stride=args.stride, lr=args.ft_lr,
                 batch_size=args.sw_batch_size, rel_mse=args.rel_mse,
-                weight_decay=0.0 if args.disable_ft_weight_decay else 0.01,
-                skip_ends=args.stage3_skip_ends, edge=args.stage3_edge,
-                edge_lr=args.stage3_edge_lr, clip_grad=args.ft_clip_grad,
-                lr_mode=args.ft_lr_mode, rel_lr=args.ft_rel_lr)
+                weight_decay=wd, stage3inner=args.stage3inner,
+                stage3innerpercent=args.stage3innerpercent,
+                stage3progressive=args.stage3progressive,
+                skip_ends=args.stage3_skip_ends,
+                edge=args.stage3_edge, edge_lr=args.stage3_edge_lr,
+                clip_grad=args.ft_clip_grad,
+                lr_mode=args.ft_lr_mode, rel_lr=args.ft_rel_lr,
+                uv_mode=args.stage3_uv_mode, lora_r=args.stage3_lora_r,
+                lora_alpha=args.stage3_lora_alpha,
+                chunk_size=args.ft_chunk_size)
         timings["stage3_finetune"] = t.elapsed
         del teacher
         gc.collect(); torch.cuda.empty_cache()
     else:
         print("\n[stage3] skipped")
 
-    # --- evaluate --------------------------------------------------------
+    # --- Evaluate & Report ------------------------------------------------
     rep = param_report(student)
     ranks_str = ",".join(str(v["rank"]) for v in meta.values())
     print(f"\n[eval] linear params {rep['linear_params']/1e9:.3f}B / "
@@ -582,11 +704,36 @@ def build_parser():
     p.add_argument("--damp", type=float, default=1e-6,
                    help="eigenvalue floor as a fraction of the largest eigenvalue")
 
-    # ranks
+    # gating / rank search
+    p.add_argument("--beta", type=float, default=0.1,
+                   help="Stage 1 gate sharpness (tanh temperature)")
+    p.add_argument("--temperature", type=float, default=10.0,
+                   help="Stage 2 gate sharpness (sigmoid temperature)")
+    p.add_argument("--z_slope", type=float, default=0.1,
+                   help="slope for seeding Z_i = (K - i) * z_slope")
+    p.add_argument("--skip_stage1", action="store_true",
+                   help="skip global rank search and seed Stage 2 uniformly")
+    p.add_argument("--stage1_epochs", type=int, default=5)
+    p.add_argument("--stage1_batch_size", type=int, default=1)
+    p.add_argument("--skip_stage2", action="store_true",
+                   help="skip sliding-window rank search")
+    p.add_argument("--stage2_epochs", type=int, default=10)
+    p.add_argument("--stagger", type=int, default=2,
+                   help="stride for the alternating even/odd window schedule")
+    p.add_argument("--rank_lr", type=float, default=5.0,
+                   help="learning rate for the gate parameters (k and Z)")
+    p.add_argument("--lambda_rank", type=float, default=1.0,
+                   help="initial Lagrange multiplier on the size penalty")
+    p.add_argument("--lambda_lr", type=float, default=10.0,
+                   help="dual ascent step size for lambda")
+    p.add_argument("--no_grad_ckpt", action="store_true",
+                   help="disable gradient checkpointing during Stage 1")
+    p.add_argument("--stage2_ckpt", type=str, default="",
+                   help="path to checkpoint/resume Stage 2 rank search")
+
+    # legacy rank reuse
     p.add_argument("--stage2_ranks", type=str, default="",
-                   help="Stage-2 resume ckpt to take per-linear ranks from "
-                        "(the gate logits themselves are basis-specific and are "
-                        "NOT transferable — only the implied ranks are)")
+                   help="Stage-2 resume ckpt to take per-linear ranks from (skips Stages 1 & 2)")
     p.add_argument("--match_ratio", action="store_true",
                    help="rescale all ranks so the realized param ratio matches "
                         "the no-split equivalent exactly")
@@ -602,17 +749,68 @@ def build_parser():
 
     # stage 3
     p.add_argument("--skip_stage3", action="store_true")
-    p.add_argument("--stage3_epochs", type=int, default=2)
+    p.add_argument("--stage3_epochs", type=int, default=2, help="epochs per window in Stage 3")
     p.add_argument("--window", type=int, default=4)
     p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--stage3inner", action="store_true",
+                   help="Skip fine-tuning the first 4 and last 4 blocks in Stage 3")
+    p.add_argument("--stage3innerpercent", action="store_true",
+                   help="Skip fine-tuning the first 20%% and last 15%% of blocks in Stage 3")
+    p.add_argument("--stage3progressive", action="store_true",
+                   help="Progressively increase and decrease window size at the ends in Stage 3")
+    p.add_argument("--stage3_skip_ends", type=int, default=0,
+                   help="leave the first N and last N blocks out of the Stage-3 "
+                        "sliding windows (1 = just blocks 0 and N-1; 4 reproduces "
+                        "--stage3inner). Takes precedence over the two flags above")
+    p.add_argument("--stage3_edge", type=str, default="skip", choices=["skip", "individual"],
+                   help="What to do with the blocks that --stage3inner/--stage3innerpercent "
+                        "leave outside the sliding band: 'skip' them (default), or fine-tune "
+                        "each one 'individual'ly, teacher-forced (input = the dense model's "
+                        "activation at that boundary, so no upstream drift enters the fit)")
+    p.add_argument("--stage3_edge_lr", type=float, default=None,
+                   help="learning rate for the individually fine-tuned edge blocks "
+                        "(defaults to --ft_lr)")
     p.add_argument("--ft_lr", type=float, default=1e-4)
-    p.add_argument("--ft_lr_mode", type=str, default="const", choices=["const", "relative"])
-    p.add_argument("--ft_rel_lr", type=float, default=3e-5)
-    p.add_argument("--ft_clip_grad", type=float, default=0.0)
-    p.add_argument("--disable_ft_weight_decay", action="store_true")
-    p.add_argument("--stage3_skip_ends", type=int, default=0)
-    p.add_argument("--stage3_edge", type=str, default="skip", choices=["skip", "individual"])
-    p.add_argument("--stage3_edge_lr", type=float, default=None)
+    p.add_argument("--ft_lr_mode", type=str, default="const", choices=["const", "relative"],
+                   help="'const' gives every tensor --ft_lr. 'relative' gives each "
+                        "tensor lr = --ft_rel_lr * rms(W), so every tensor moves the "
+                        "same *fraction* of its own size per step")
+    p.add_argument("--ft_rel_lr", type=float, default=3e-5,
+                   help="only with --ft_lr_mode relative. Each weight may move about "
+                        "rel_lr * (samples * epochs) times its own RMS per window; "
+                        "3e-5 with 128 samples and 2 epochs is ~0.8%% per window")
+    p.add_argument("--stage3_uv_mode", type=str, default="joint",
+                   choices=["joint", "sequential"],
+                   help="'joint' trains fc_u and fc_v together (one sweep). "
+                        "'sequential' sweeps twice: fc_u with fc_v frozen, then "
+                        "fc_v with the updated fc_u frozen. Removes the "
+                        "(W_u M, M^-1 W_v) gauge freedom that joint training "
+                        "wastes steps on; costs 2x the Stage-3 time")
+    p.add_argument("--stage3_lora_r", type=int, default=0,
+                   help="0 (default) updates W_u/W_v directly at full rank. "
+                        ">0 attaches a rank-r LoRA adapter to each targeted "
+                        "linear instead (B=0, A kaiming — SVD-LLM's setup) and "
+                        "merges it back at the end of each pass, so the update "
+                        "to each matrix is rank-limited but the parameter count "
+                        "is unchanged")
+    p.add_argument("--stage3_lora_alpha", type=float, default=16.0,
+                   help="LoRA scaling is alpha/r; 16 with r=8 reproduces "
+                        "SVD-LLM's 2.0")
+    p.add_argument("--ft_dataset", type=str, default="wikitext2",
+                   choices=["wikitext2", "alpaca"],
+                   help="Dataset to use for Stage 3 fine-tuning. 'wikitext2' reuses "
+                        "the Stage 0-2 calibration samples. 'alpaca' loads the "
+                        "yahma/alpaca-cleaned dataset.")
+    p.add_argument("--ft_chunk_size", type=int, default=1024,
+                   help="Number of sequences to process at a time during Stage 3 "
+                        "fine-tuning. Prevents Host RAM OOM when using large "
+                        "datasets like alpaca.")
+    p.add_argument("--ft_clip_grad", type=float, default=0.0,
+                   help="max grad-norm for Stage 3; 0 disables. Single-sample loss spikes "
+                        "of 1e6 have been observed in the deep windows, so 1.0 is a "
+                        "reasonable value")
+    p.add_argument("--disable_ft_weight_decay", action="store_true",
+                   help="Disable AdamW weight decay in Stage 3")
     p.add_argument("--rel_mse", action="store_true", default=True)
 
     # io
